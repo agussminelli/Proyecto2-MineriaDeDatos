@@ -1,0 +1,13 @@
+# Private dataset
+verbal_autopsy/
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated files
+output/
+embedding_cache/

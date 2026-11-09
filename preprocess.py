@@ -57,7 +57,7 @@ def preprocess_dataset(df, text_cols=None, cat_cols=None, num_cols=None, downloa
         tokens = word_tokenize(text)
         
         # Stop word removal
-        stop_words = set(stopwords.words('english'))
+        stop_words = set(stopwords.words('english')) - {'no', 'not', 'nor', 'neither', 'never', 'without'}
         filtered_tokens = [w for w in tokens if not w in stop_words]
         
         # Lemmatization

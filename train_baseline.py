@@ -12,9 +12,7 @@ def train_baseline():
     print("--- Training Baseline: TF-IDF + SVM ---")
     
     # 1. Load and Partition Data 
-    train_data, _, headers, _, _ = simple_load_dataset(
-        dataset_dir="/Users/frejaschon/Downloads/DATA_MDD"
-    )
+    train_data, _, headers, _, _ = simple_load_dataset()
     
     train_df, dev_df, test_df = create_stratified_partitions(
         raw_data=train_data, headers=headers, target_col="gs_text34"

@@ -8,12 +8,17 @@ from sklearn.metrics import accuracy_score, classification_report
 from loading_dataset import load_dataset
 from preprocess import preprocess_dataset
 from random_forest import RandomForest
+from simple_load_dataset import simple_load_dataset
 
 
 def main():
 
     # 1. Load dataset
-    train, _, train_headers, _, _ = load_dataset()
+    train, _, train_headers, _, _ = simple_load_dataset()
+    df = pd.DataFrame(train, columns=train_headers)
+
+    print("Columnas del dataset:")
+    print(df.columns.tolist())
 
     df = pd.DataFrame(train, columns=train_headers)
 
@@ -25,15 +30,16 @@ def main():
     )
 
     # 3. Select text and labels
+   # 3. Select text and labels
     df = df[
+        (df["open_response_clean"].notna()) &
         (df["open_response_clean"].str.strip() != "") &
-        (df["gs_grouped"].notna()) &
-        (df["gs_grouped"].str.strip() != "")
+        (df["gs_text34"].notna()) &
+        (df["gs_text34"].str.strip() != "")
     ].copy()
 
     X = df["open_response_clean"]
-    y = df["gs_grouped"]
-
+    y = df["gs_text34"]
     # 4. Split train and validation
     X_train, X_val, y_train, y_val = train_test_split(
         X,

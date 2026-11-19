@@ -11,3 +11,4 @@ venv/
 # Generated files
 output/
 embedding_cache/
+*.pkl

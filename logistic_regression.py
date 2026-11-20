@@ -3,10 +3,14 @@ from sklearn.multiclass import OneVsRestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import f1_score, classification_report
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import f1_score, accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, GroupKFold
 
 import pandas as pd
+from pathlib import Path
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
 from simple_load_dataset import simple_load_dataset
 from divide_data import create_stratified_partitions
@@ -240,72 +244,132 @@ def experiment_without_svd():
         )
 
 
-def create_LR_pipeline(with_SVD=True, OAA=True):
-    # Previously selected hyperparameters
-    C = 1 if OAA and with_SVD else 10
+def create_LR_pipeline(cfg=None, with_SVD=True, OAA=True):
 
-    classifier = LogisticRegression(C=C,max_iter=2000,class_weight="balanced")
+    if cfg is not None:
+        max_features=cfg.vectorizer.max_features
+        ngram_range=cfg.vectorizer.ngram_range
+        n_components=cfg.svd.n_components
+        random_state=cfg.svd.random_state
+        max_iter=cfg.classifier.max_iter
+        class_weight=cfg.classifier.class_weight
+        C=1.0 #Default, Grid search will overwrite 
+    else:
+        max_features=5000
+        ngram_range=(1,3)
+        n_components=300
+        random_state=42
+        max_iter=2000
+        class_weight="balanced"
+        # Previously selected hyperparameters
+        C = 1 if OAA and with_SVD else 10
+
+    classifier = LogisticRegression(C=C,max_iter=max_iter,class_weight=class_weight, solver="lbfgs")
     if OAA:
         classifier = OneVsRestClassifier(classifier)
 
-    steps = [("tfidf", TfidfVectorizer(max_features=5000,ngram_range=(1, 3)))]
+    steps = [("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range))]
     if with_SVD:
-        steps.append(("svd",TruncatedSVD(n_components=300,random_state=42)))
+        steps.append(("svd",TruncatedSVD(n_components=n_components,random_state=random_state)))
     steps.append(("clf", classifier))
 
     return Pipeline(steps)
 
-def run_loso_experiments(adult_only=False):
+
+@hydra.main(version_base=None,config_path="conf",config_name="config")
+def run_loso_experiments(cfg: DictConfig):
     train_df, dev_df,_ = load_and_preprocess(return_df=True)    
     exp_combination=[(True,True),
                      (True,False),
                      (False,True),
                      (False,False)]
+    adult_only=cfg.experiment.adult_only
     results = []
+    all_predictions = []
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     for with_SVD, OAA in exp_combination:
         print(f"\nWith SVD={with_SVD}, OAA={OAA}")
         for site, fold_train, fold_eval in create_loso_sets(
-            train_df, dev_df, adult_only=False
+            train_df, dev_df, adult_only
         ):
-            X_train = fold_train["open_response_clean"]
-            y_train = fold_train["gs_text34"]
-
-            X_eval = fold_eval["open_response_clean"]
-            y_eval = fold_eval["gs_text34"]
+            text_c=cfg.data.text_column
+            target_c=cfg.data.target_column
+            site_c=cfg.data.site_column
 
             # Important: create a fresh model for each fold!
-            model = create_LR_pipeline(with_SVD=with_SVD,OAA=OAA)
+            pipeline = create_LR_pipeline(with_SVD=with_SVD,OAA=OAA)
 
-            model.fit(X_train, y_train)
-            predictions = model.predict(X_eval)
-
-            f1 = f1_score(
-                y_eval,
-                predictions,
-                average="macro",
-                zero_division=0
+            c_param = ("clf__estimator__C" if OAA else "clf__C")
+            search = GridSearchCV(
+                estimator=pipeline,
+                param_grid={c_param:list(cfg.classifier.c_values)},
+                scoring=cfg.validation.scoring,
+                cv=GroupKFold(n_splits=cfg.validation.n_splits),
+                n_jobs=-1,
+                refit=True
             )
+            # Grouped validation: no site appears
+            # in both inner training and validation
+            search.fit(fold_train[text_c],fold_train[target_c],groups=fold_train[site_c])
+            
+            predictions = search.predict(fold_eval[text_c])
+            prediction_df = pd.DataFrame({
+                "newid": fold_eval["newid"].to_numpy(),
+                "site": site,
+                "true_label": fold_eval["gs_text34"].to_numpy(),
+                "predicted_label": predictions,
+                "with_SVD": with_SVD,
+                "OAA": OAA
+            })
+            all_predictions.append(prediction_df)
 
-            results.append({
+            f1 = f1_score(fold_eval[target_c],predictions,average="macro",zero_division=0)
+
+            result = {
                 "site": site,
                 "adult_only": adult_only,
                 "with_SVD": with_SVD,
                 "OAA": OAA,
                 "train_size": len(fold_train),
                 "eval_size": len(fold_eval),
-                "macro_f1": f1
-            })
-            print(f"{site}: Macro-F1={f1:.4f}")
+                "best_C": search.best_params_[c_param],
+                "cv_macro_f1": search.best_score_,
+                "eval_macro_f1": f1,
+                "eval_accuracy": accuracy_score(fold_eval[target_c],predictions)
+            }
+            results.append(result)
 
-    results_df = pd.DataFrame(results)
 
-    results_df.to_csv(
-        f"loso_results_{'adult' if adult_only else 'all'}.csv",
-        index=False
+            print(
+                f"{site}: "
+                f"C={result['best_C']}, "
+                f"CV={result['cv_macro_f1']:.4f}, "
+                f"LOSO F1={result['eval_macro_f1']:.4f}"
+            )
+
+            filename = ("loso_adult.csv" if adult_only else "loso_all.csv")
+
+            pd.DataFrame(results).to_csv(output_dir / filename,index=False)
+            pd.concat(all_predictions,ignore_index=True).to_csv(
+                output_dir / "predictions.csv",
+                index=False
+            )
+    
+    # Save selected hyperparameters as structured YAML
+    OmegaConf.save(
+        OmegaConf.create({
+            f"{r['site']}_{'svd' if r['with_SVD'] else 'no_svd'}_"
+            f"{'oaa' if r['OAA'] else 'multinomial'}": {
+                "best_C": float(r["best_C"]),
+                "cv_macro_f1": float(r["cv_macro_f1"])
+            }
+            for r in results
+        }),
+        output_dir / "best_parameters.yaml"
     )
-
-    return results_df
+    return pd.DataFrame(results)
 
 
 if __name__ == "__main__":
@@ -314,5 +378,13 @@ if __name__ == "__main__":
     # compare_performance_on_diff_sites()
     # experiment_without_svd()
 
-    results_all = run_loso_experiments(adult_only=False)
-    results_adult = run_loso_experiments(adult_only=True)
+    results = run_loso_experiments()
+
+# # All modules
+# python logistic_regression.py experiment.adult_only=false
+
+# # Adult only
+# python loso_experiments.py experiment.adult_only=true
+
+# # Different regularization search
+# python loso_experiments.py classifier.c_values=[0.1,1,10]

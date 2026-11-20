@@ -1,0 +1,34 @@
+defaults:
+  - _self_
+
+experiment:
+  name: loso_logistic_regression
+  adult_only: false
+
+data:
+  text_column: open_response_clean
+  target_column: gs_text34
+  site_column: site
+
+vectorizer:
+  max_features: 5000
+  ngram_range: [1, 3]
+
+svd:
+  n_components: 300
+  random_state: 42
+
+classifier:
+  max_iter: 2000
+  class_weight: balanced
+  c_values: [0.01, 0.1, 1, 10, 100]
+
+validation:
+  n_splits: 3
+  scoring: f1_macro
+
+hydra:
+  run:
+    dir: output/${experiment.name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

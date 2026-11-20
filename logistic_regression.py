@@ -261,7 +261,7 @@ def create_LR_pipeline(cfg=None, with_SVD=True, OAA=True):
     if OAA:
         classifier = OneVsRestClassifier(classifier)
 
-    steps = [("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range))]
+    steps = [("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range,max_df=0.85,))]
     if with_SVD:
         steps.append(("svd",TruncatedSVD(n_components=n_components,random_state=random_state)))
     steps.append(("clf", classifier))

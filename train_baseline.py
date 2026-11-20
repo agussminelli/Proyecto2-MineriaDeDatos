@@ -8,6 +8,31 @@ from simple_load_dataset import simple_load_dataset
 from divide_data import create_stratified_partitions
 from preprocess import preprocess_dataset
 
+def create_SVM_pipeline(cfg=None):
+    if cfg is not None:
+        max_features=cfg.vectorizer.max_features
+        ngram_range=tuple(cfg.vectorizer.ngram_range)
+        n_components=cfg.svd.n_components
+        random_state=cfg.svd.random_state
+        max_iter=cfg.classifier.max_iter
+        class_weight=cfg.classifier.class_weight
+        C=1.0 #Default, Grid search will overwrite 
+    else:
+        max_features=5000
+        ngram_range=(1,3)
+        n_components=300
+        random_state=42
+        max_iter=2000
+        class_weight="balanced"
+        # Previously selected hyperparameters
+        C = 1.0
+
+    return Pipeline([
+        ("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range,max_df=0.85,)),
+        ("svd", TruncatedSVD(n_components=n_components,random_state=random_state,)),
+        ("clf", LinearSVC(C=C,class_weight=class_weight,max_iter=max_iter,random_state=random_state,))
+    ])
+
 def train_baseline():
     print("--- Training Baseline: TF-IDF + SVM ---")
     
@@ -26,12 +51,7 @@ def train_baseline():
     X_dev, y_dev = dev_df["open_response_clean"], dev_df["gs_text34"]
 
     # 3. Build and Train Pipeline
-    pipeline = Pipeline([
-        ('tfidf', TfidfVectorizer(max_features=5000, ngram_range=(1, 3), max_df=0.85)),
-        ('svd', TruncatedSVD(n_components=300, random_state=42)),
-        ('svm', LinearSVC(class_weight="balanced", max_iter=2000, random_state=42))
-    ])
-    
+    pipeline = create_SVM_pipeline()
     pipeline.fit(X_train, y_train)
     
     # 4. Evaluate on Dev Partition

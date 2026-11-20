@@ -2,29 +2,22 @@ import pandas as pd
 from sklearn.model_selection import LeaveOneGroupOut
 
 
-def create_loso_sets(train_df, dev_df, adult_only=False):
-    research_df = pd.concat(
-        [train_df, dev_df],
-        ignore_index=True
-    )
+def create_loso_sets(cfg, research_df):
+
+    target_c=cfg.data.target_column
+    site_c=cfg.data.site_column
 
     logo = LeaveOneGroupOut()
 
-    if adult_only:
-        research_df = research_df[
-            research_df["module"] == "Adult"
-        ].copy()
-        print("ADULT ONLY:")
-
     for train_idx, eval_idx in logo.split(
         research_df,
-        y=research_df["gs_text34"],
-        groups=research_df["site"]
+        y=research_df[target_c],
+        groups=research_df[site_c]
     ):
         fold_train = research_df.iloc[train_idx]
         fold_eval = research_df.iloc[eval_idx]
 
-        held_out_site = fold_eval["site"].iloc[0]
+        held_out_site = fold_eval[site_c].iloc[0]
 
         print(
             f"{held_out_site}: "
@@ -46,10 +39,14 @@ if __name__ == "__main__":
     from sklearn.multiclass import OneVsRestClassifier
 
 #Usage
-    train_df, dev_df,_ = load_and_preprocess(return_df=True)    
+    train_df, dev_df,_ = load_and_preprocess(return_df=True)   
+    research_df = pd.concat(
+        [train_df, dev_df],
+        ignore_index=True
+    ) 
 
     for site, fold_train, fold_eval in create_loso_sets(
-        train_df, dev_df, adult_only=False
+        research_df, adult_only=False
     ):
         X_train = fold_train["open_response_clean"]
         y_train = fold_train["gs_text34"]

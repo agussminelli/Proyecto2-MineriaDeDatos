@@ -404,6 +404,32 @@ def run_predict_site_exp(cfg):
 
     return results_df
 
+def run_module_only_site_pred(cfg):
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.linear_model import LogisticRegression
+
+    train_df, dev_df,_ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df],ignore_index=True)
+    output_dir =  Path(HydraConfig.get().runtime.output_dir)
+    max_iter=cfg.classifier.max_iter
+    random_state = cfg.svd.random_state
+
+    for fold in create_site_prediction_sets(cfg, research_df):
+
+        train = fold["train"]
+        eval_df = fold["eval"]
+
+        module_model = make_pipeline(
+            OneHotEncoder(handle_unknown="ignore"),
+            LogisticRegression(max_iter=max_iter,random_state=random_state)
+        )
+
+        module_model.fit(train[["module"]],train["site"])
+        pred = module_model.predict(eval_df[["module"]])
+        accuracy = accuracy_score(eval_df["site"], pred)
+        print(f"Seed {fold['seed']}: {accuracy:.4f}")
+
 
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
@@ -415,6 +441,8 @@ def main(cfg: DictConfig):
         run_controlled_loso_experiment(cfg)
     elif exp == "site_prediction":
         run_predict_site_exp(cfg)
+    elif exp == "module_influence_on_site":
+        run_module_only_site_pred(cfg)
     else:
         print("Please check experiment name in config")
 

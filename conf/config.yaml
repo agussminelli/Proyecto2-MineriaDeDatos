@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 experiment:
-  name: loso_LR_controlled #site_prediction #loso_LR
+  name: module_influence_on_site #loso_LR_controlled #site_prediction #loso_LR
   adult_only: false
   filter_voc: true
 

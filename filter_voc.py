@@ -19,6 +19,37 @@ DOCUMENTATION_TERMS = [
     "the participant",
 ]
 
+DOCUMENTATION_TERMS_V2 = [
+    # Initial terms
+    "interview",
+    "interviewee",
+    "interviewer",
+    "informant",
+    "respondent",
+    "respondant",
+    "participant",
+
+    # Interview administration
+    "client",
+    "no comment",
+    "went smoothly",
+    "service provided",
+    "thanked",
+    "comment",
+    "opinion"
+
+    # Reporting language
+    "respondent explained",
+    "participant stated",
+    "informant reported",
+    "according participant",
+    "explained that",
+
+    # About Deathcauses -> so we dont need the word itself
+    "deceased died",
+    "cause death"
+]
+
 
 class DocumentationFilter(BaseEstimator, TransformerMixin):
 
@@ -31,7 +62,7 @@ class DocumentationFilter(BaseEstimator, TransformerMixin):
     def transform(self, X):
         print("Filtering Documentation Vocabulary...")
         terms = (
-            DOCUMENTATION_TERMS
+            DOCUMENTATION_TERMS_V2
             if self.terms is None
             else self.terms
         )

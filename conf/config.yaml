@@ -2,9 +2,16 @@ defaults:
   - _self_
 
 experiment:
-  name: loso_logistic_regression
+  name: loso_LR_controlled
   adult_only: false
 
+controlled_loso:
+  min_count: 10
+  eval_fraction: 0.20
+  seeds: [42, 123, 456, 789, 2026, 11, 17, 23, 31, 47,
+          59, 71, 83, 97, 109, 127, 139, 151, 163, 179,
+          191, 211, 223, 239, 251, 269, 281, 307, 331, 347]
+          
 data:
   text_column: open_response_clean
   target_column: gs_text34

@@ -8,13 +8,12 @@ from hydra.core.hydra_config import HydraConfig
 from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.metrics import f1_score, accuracy_score
 
-from LOSO_sets import create_loso_sets
+from loso_sets import create_loso_sets, create_controlled_site_sets
 from logistic_regression import load_and_preprocess, create_LR_pipeline
 from train_baseline import create_SVM_pipeline
+from data_exploration import exploration_for_controlled_loso
 
 
-
-@hydra.main(version_base=None,config_path="conf",config_name="config")
 def run_loso_experiments(cfg: DictConfig):
 
     adult_only=cfg.experiment.adult_only
@@ -168,10 +167,107 @@ def run_loso_experiments(cfg: DictConfig):
     )
     return pd.DataFrame(results)
 
-if __name__ == "__main__":
-    run_loso_experiments()
 
-    
+def run_controlled_loso_experiment(cfg):
+
+    train_df, dev_df,_ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df],ignore_index=True)
+    output_dir =  Path(HydraConfig.get().runtime.output_dir)
+
+    results = []
+
+    for fold in create_controlled_site_sets(cfg, research_df):
+
+        for condition in ["seen", "unseen"]:
+            train = fold[f"train_{condition}"]
+            eval_df = fold["eval"]
+
+            pipeline = create_LR_pipeline(with_SVD=False,OAA=False)
+
+            pipeline.set_params(clf__C=1.0)
+
+            pipeline.fit(
+                train["open_response_clean"],
+                train["gs_text34"]
+            )
+
+            pred = pipeline.predict(
+                eval_df["open_response_clean"]
+            )
+
+            f1 = f1_score(
+                eval_df["gs_text34"],
+                pred,
+                labels=fold["classes"],
+                average="macro",
+                zero_division=0
+            )
+
+            results.append({
+                "seed": fold["seed"],
+                "site": fold["site"],
+                "condition": condition,
+                "macro_f1": float(f1),
+                "train_size": len(train),
+                "eval_size": len(eval_df)
+            })
+
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(
+        output_dir / "controlled_site_results.csv",
+        index=False
+    )
+
+    paired = results_df.pivot(
+        index=["seed", "site"],
+        columns="condition",
+        values="macro_f1"
+    ).reset_index()
+
+    paired["gap"] = paired["seen"] - paired["unseen"]
+
+    summary = (
+        paired.groupby("site")
+        .agg(
+            seen_mean=("seen", "mean"),
+            seen_median=("seen", "median"),
+            unseen_mean=("unseen", "mean"),
+            unseen_median=("unseen", "median"),
+            gap_mean=("gap", "mean"),
+            gap_median=("gap", "median"),
+            gap_std=("gap", "std"),
+            gap_q25=("gap", lambda x: x.quantile(0.25)),
+            gap_q75=("gap", lambda x: x.quantile(0.75)),
+            n_seeds=("seed", "nunique")
+        )
+        .reset_index()
+    )
+
+    summary["gap_iqr"] = summary["gap_q75"] - summary["gap_q25"]
+
+    summary.to_csv(
+        output_dir / "controlled_site_summary.csv",
+        index=False
+    )
+
+@hydra.main(version_base=None,config_path="conf",config_name="config")
+def main(cfg: DictConfig):
+
+    exp=cfg.experiment.name
+    if exp=="loso_LR":
+        run_loso_experiments(cfg)
+    elif exp == "loso_LR_controlled":
+        run_controlled_loso_experiment(cfg)
+    else:
+        print("Please check experiment name in config")
+
+    # exploration_for_controlled_loso(train_df, dev_df)
+
+
+if __name__ == "__main__":
+
+    main()
+
     # # All modules
     # py loso_experiments.py experiment.adult_only=false
 

@@ -1,0 +1,31 @@
+Input:
+    Research dataset (Train + Dev)
+    Minimum class frequency = 10
+    Evaluation fraction = 0.20
+    Random seeds
+
+1. Find causes occurring at least 10 times at EVERY site.
+
+2. For each selected cause:
+    quota[cause] = minimum site-specific count
+
+3. For each random seed:
+    For each site and cause:
+        a. Randomly sample quota[cause] narratives
+        b. Reserve approximately 20% for evaluation
+        c. Keep the remaining 80% as training candidates
+
+4. For each target site:
+    UNSEEN:
+        Use training candidates from the other 5 sites
+
+    SEEN:
+        Include training candidates from the target site
+        Replace an equal number from the other 5 sites
+        Preserve the number of samples per cause
+
+    EVALUATION:
+        Use exactly the same target-site examples
+        for UNSEEN and SEEN
+
+5. Return both training sets and their shared evaluation set.  

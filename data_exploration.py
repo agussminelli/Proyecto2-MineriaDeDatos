@@ -5,6 +5,7 @@ from sklearn.metrics import f1_score, accuracy_score
 from simple_load_dataset import simple_load_dataset
 from divide_data import create_stratified_partitions
 from preprocess import preprocess_dataset
+from logistic_regression import load_and_preprocess
 
 
 def explore_subgroups():
@@ -104,6 +105,76 @@ def explore_subgroups():
         print(f"\n{col}:")
         print(pd.DataFrame(results).round(3).to_string(index=False))
 
+def exploration_for_controlled_loso(train_df, dev_df):
+
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+
+    counts = pd.crosstab(
+        research_df["gs_text34"],
+        research_df["site"]
+    )
+
+    for min_samples in [1, 5, 10, 15, 20, 30]:
+        eligible = counts[
+            (counts >= min_samples).all(axis=1)
+        ]
+
+        print(
+            f"Minimum {min_samples:2d}: "
+            f"{len(eligible)} classes, "
+            f"{len(eligible) * min_samples * 6} "
+            f"balanced samples"
+        )
+
+    print("\nCommon classes:")
+    print(counts[(counts > 0).all(axis=1)])
+
+
+def check_duplicated_newIDs(research_df):
+
+    print("Total rows:", len(research_df))
+    print("Unique newid:", research_df["newid"].nunique())
+
+    print("Duplicate newid values:",
+        research_df["newid"].duplicated().sum())
+
+    print("Duplicate site-newid pairs:",
+        research_df.duplicated(subset=["site", "newid"]).sum())
+
+    duplicates = research_df[
+        research_df.duplicated(
+            subset=["site", "newid"],keep=False)
+    ].copy()
+
+    print("Rows involved:", len(duplicates))
+    print("Unique duplicated groups:",
+        duplicates.groupby(["site", "newid"]).ngroups)
+
+    print("\nGroups with different causes:",
+        (duplicates.groupby(["site", "newid"])["gs_text34"]
+            .nunique() > 1).sum())
+
+    print("\nGroups with different narratives:",
+        (duplicates.groupby(["site", "newid"])["open_response_clean"]
+            .nunique(dropna=False) > 1).sum())
+
+    # print("\nExamples:")
+    # print(duplicates[
+    #         ["site", "newid", "module", "gs_text34", "open_response_clean"]
+    #     ].sort_values(["site", "newid"]).head(12).to_string(index=False)
+    # )
+
+    print("Duplicate site-module-newid combinations:",
+        research_df.duplicated(
+            subset=["site", "module", "newid"]).sum())
+    print("Groups with multiple modules:",
+        (research_df.groupby(["site", "newid"])["module"]
+            .nunique() > 1).sum())
+
 
 if __name__ == "__main__":
-    explore_subgroups()
+
+    train_df, dev_df,_= load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+    check_duplicated_newIDs(research_df)
+    # explore_subgroups()

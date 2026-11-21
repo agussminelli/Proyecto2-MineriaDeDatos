@@ -7,6 +7,8 @@ from hydra.core.hydra_config import HydraConfig
 
 from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.metrics import f1_score, accuracy_score
+from sklearn.base import clone
+from sklearn.feature_selection import mutual_info_classif
 
 from loso_sets import create_loso_sets, create_controlled_site_sets, create_site_prediction_sets
 from logistic_regression import load_and_preprocess, create_LR_pipeline
@@ -431,6 +433,304 @@ def run_module_only_site_pred(cfg):
         print(f"Seed {fold['seed']}: {accuracy:.4f}")
 
 
+
+def E2_autocut_top_site_features(cfg):
+    """
+    E2: Automatic removal of site-associated TF-IDF features.
+
+    Experiments:
+        E0      Original TF-IDF (reference)
+        E2_1pct Remove top 1% site-associated features
+        E2_2pct Remove top 2% site-associated features
+        E2_5pct Remove top 5% site-associated features
+
+    Evaluation:
+        All modules, 14-class Leave-One-Site-Out
+        Multinomial Logistic Regression, no SVD
+        Fixed C=1.0
+
+    Feature selection:
+        Mutual Information(feature presence, site)
+        Calculated ONLY on the five training sites.
+
+    CSV outputs:
+        e2_results.csv
+        e2_predictions.csv
+        e2_removed_features.csv
+        e2_summary.csv
+    """
+
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+
+    research_df = pd.concat([train_df, dev_df],ignore_index=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+
+    labels = sorted(research_df[target_c].unique())
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = [0.0, 0.01, 0.02, 0.05]
+
+    results = []
+    all_predictions = []
+    all_removed_features = []
+
+    reference_pipeline = create_LR_pipeline(with_SVD=False,OAA=False)
+    # same vectorizer and classifier settings C=1.0 fixed
+    base_classifier = clone(reference_pipeline.named_steps["clf"])
+    base_classifier.set_params(C=1.0)
+
+    # Outer Loso-Loop
+    for held_out_site, fold_train, fold_eval in (
+        create_loso_sets(cfg, research_df)
+    ):
+
+        print(f"\n{'=' * 50}")
+        print(f"HELD-OUT SITE: {held_out_site}")
+        print(f"{'=' * 50}")
+        print(f"Train={len(fold_train)}\tEval={len(fold_eval)}")
+
+        # 3.1 Fit TF-IDF on training sites ONLY
+        vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+
+        X_train = vectorizer.fit_transform(fold_train[text_c])
+        X_eval = vectorizer.transform(fold_eval[text_c])
+
+        y_train = fold_train[target_c].to_numpy()
+        y_eval = fold_eval[target_c].to_numpy()
+
+        n_features = X_train.shape[1]
+        feature_names = (vectorizer.get_feature_names_out())
+        print(f"TF-IDF features: {n_features}")
+
+        # 3.2 Calculate Site Mutual Information
+
+        # Convert TF-IDF to binary presence/absence.
+        # MI should measure whether a term occurs,
+        # not the magnitude of its TF-IDF weight.
+        X_binary = X_train.copy().tocsr()
+        X_binary.data[:] = 1.0
+
+        site_scores = mutual_info_classif(
+            X_binary,
+            fold_train[site_c].to_numpy(),
+            discrete_features=True,
+            random_state=42
+        )
+
+        # Document frequency:
+        # Number of training narratives containing
+        # the respective TF-IDF feature.
+        doc_frequency = np.asarray(X_binary.getnnz(axis=0)).ravel()
+
+        # Sort by decreasing site MI.
+        # Feature index breaks ties deterministically.
+        ranking = np.lexsort((np.arange(n_features),-site_scores))
+
+
+        # 3.3 E0 + E2 filtering configurations
+        for threshold in thresholds:
+
+            if threshold == 0.0:
+                experiment = "E0"
+                removed_idx = np.array([], dtype=int)
+            else:
+                experiment = (f"E2_{int(threshold * 100)}pct")
+                n_remove = max(1,int(np.ceil(n_features * threshold)))
+                removed_idx = ranking[:n_remove]
+
+            n_removed = len(removed_idx)
+
+            print(f"\n{experiment}: Removing {n_removed}/{n_features} features")
+
+
+            # 3.4 feature-column masking
+            weights = np.ones(n_features,dtype=np.float64)
+            weights[removed_idx] = 0.0
+
+            X_train_filtered = (X_train.multiply(weights).tocsr())
+            X_eval_filtered = (X_eval.multiply(weights).tocsr())
+
+            # 3.5 Train Logistic Regression
+            classifier = clone(base_classifier)
+            classifier.fit(X_train_filtered,y_train)
+            predictions = classifier.predict(X_eval_filtered)
+
+            # 3.6 Calculate evaluation metrics
+            macro_f1 = f1_score(
+                y_eval,
+                predictions,
+                labels=labels,
+                average="macro",
+                zero_division=0
+            )
+            accuracy = accuracy_score(y_eval,predictions)
+            print(
+                f"Macro-F1={macro_f1:.4f}, "
+                f"Accuracy={accuracy:.4f}"
+            )
+
+
+            # 3.7 Save metrics for this site and indiv. predictions
+            results.append({
+                "experiment": experiment,
+                "held_out_site": held_out_site,
+                "threshold": float(threshold),
+                "n_features": int(n_features),
+                "n_removed": int(n_removed),
+                "train_size": len(fold_train),
+                "eval_size": len(fold_eval),
+                "C": 1.0,
+                "macro_f1": float(macro_f1),
+                "accuracy": float(accuracy)
+            })
+
+            prediction_df = pd.DataFrame({
+                "experiment": experiment,
+                "held_out_site": held_out_site,
+                "site": fold_eval[site_c].to_numpy(),
+                "module": fold_eval["module"].to_numpy(),
+                "newid": fold_eval["newid"].to_numpy(),
+                "true_label": y_eval,
+                "predicted_label": predictions
+            })
+            all_predictions.append(prediction_df)
+
+            # 3.8 Document removed features
+            for rank, idx in enumerate(removed_idx,start=1):
+                all_removed_features.append({
+                    "experiment": experiment,
+                    "held_out_site": held_out_site,
+                    "threshold": float(threshold),
+                    "rank": rank,
+                    "feature": feature_names[idx],
+                    "site_mi": float(site_scores[idx]),
+                    "document_frequency": int(doc_frequency[idx]),
+                    "document_frequency_ratio": float(
+                        doc_frequency[idx] / len(fold_train)
+                    )
+                })
+        # 3.9 Save incrementally after each site
+        pd.DataFrame(results).to_csv(output_dir / "e2_results.csv",index=False)
+        pd.concat(all_predictions,ignore_index=True).to_csv(
+            output_dir / "e2_predictions.csv",
+            index=False
+        )
+        pd.DataFrame(all_removed_features).to_csv(
+            output_dir / "e2_removed_features.csv",
+            index=False
+        )
+        print(f"\nSaved results for {held_out_site}")
+
+    # 4. Aggregate results across all six sites
+    results_df = pd.DataFrame(results)
+    summary_rows = []
+    for experiment, group in results_df.groupby("experiment",sort=False):
+
+        # Mean and standard deviation of six site F1s
+        mean_f1 = group["macro_f1"].mean()
+        std_f1 = group["macro_f1"].std(ddof=1)
+        median_f1 = group["macro_f1"].median()
+
+        mean_accuracy = group["accuracy"].mean()
+
+        # Pooled Macro-F1:
+        experiment_predictions = pd.concat(
+            [
+                df for df in all_predictions
+                if df["experiment"].iloc[0] == experiment
+            ],
+            ignore_index=True
+        )
+
+        pooled_f1 = f1_score(
+            experiment_predictions["true_label"],
+            experiment_predictions["predicted_label"],
+            labels=labels,
+            average="macro",
+            zero_division=0
+        )
+
+        summary_rows.append({
+            "experiment": experiment,
+            "threshold": float(
+                group["threshold"].iloc[0]
+            ),
+            "mean_loso_macro_f1": float(mean_f1),
+            "median_loso_macro_f1": float(median_f1),
+            "std_loso_macro_f1": float(std_f1),
+            "pooled_loso_macro_f1": float(pooled_f1),
+            "mean_accuracy": float(mean_accuracy),
+            "n_sites": int(len(group))
+        })
+
+    summary = pd.DataFrame(summary_rows)
+
+    # 5. Compare every experiment against E0
+    baseline = results_df[
+        results_df["experiment"] == "E0"
+    ][["held_out_site", "macro_f1", "accuracy"]].rename(
+        columns={
+            "macro_f1": "baseline_f1",
+            "accuracy": "baseline_accuracy"
+        }
+    )
+
+    results_df = results_df.merge(
+        baseline,
+        on="held_out_site",
+        how="left",
+        validate="many_to_one"
+    )
+
+    results_df["delta_f1_vs_E0"] = (
+        results_df["macro_f1"]
+        - results_df["baseline_f1"]
+    )
+
+    results_df["delta_accuracy_vs_E0"] = (
+        results_df["accuracy"]
+        - results_df["baseline_accuracy"]
+    )
+
+    # Update per-site results with paired differences
+    results_df.to_csv(output_dir / "e2_results.csv",index=False)
+
+    mean_deltas = (
+        results_df.groupby("experiment")[
+            "delta_f1_vs_E0"
+        ].mean()
+    )
+
+    summary["delta_mean_f1_vs_E0"] = (
+        summary["experiment"].map(mean_deltas)
+    )
+
+    pooled_baseline = summary.loc[
+        summary["experiment"] == "E0",
+        "pooled_loso_macro_f1"
+    ].iloc[0]
+
+    summary["delta_pooled_f1_vs_E0"] = (
+        summary["pooled_loso_macro_f1"]
+        - pooled_baseline
+    )
+
+    summary.to_csv(output_dir / "e2_summary.csv",index=False)
+
+    print("\n" + "=" * 60)
+    print("E2 — FINAL LOSO SUMMARY")
+    print("=" * 60)
+    print(summary.to_string(index=False))
+
+    return results_df, summary
+
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -443,6 +743,8 @@ def main(cfg: DictConfig):
         run_predict_site_exp(cfg)
     elif exp == "module_influence_on_site":
         run_module_only_site_pred(cfg)
+    elif exp == "E2_autocut_top_site_features":
+        E2_autocut_top_site_features(cfg)
     else:
         print("Please check experiment name in config")
 

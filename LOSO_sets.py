@@ -159,6 +159,114 @@ def create_controlled_site_sets(cfg, research_df):
                 "eval": eval_df,
             }
 
+
+def create_site_prediction_sets(cfg, research_df):
+
+    target = cfg.data.target_column       # gs_text34
+    site_col = cfg.data.site_column       # site
+
+    min_count = int(cfg.controlled_loso.min_count)
+    eval_fraction = float(cfg.controlled_loso.eval_fraction)
+    seeds = list(cfg.controlled_loso.seeds)
+
+    research_df = research_df.copy().reset_index(drop=True)
+    research_df["_row_id"] = np.arange(len(research_df))
+
+    counts = pd.crosstab(
+        research_df[target],
+        research_df[site_col]
+    )
+
+    eligible = counts[
+        (counts >= min_count).all(axis=1)
+    ]
+
+    classes = eligible.index.tolist()
+    sites = counts.columns.tolist()
+
+    if not classes:
+        raise ValueError("No eligible causes found.")
+
+    quotas = eligible.min(axis=1).astype(int).to_dict()
+
+    eval_quotas = {
+        cause: max(1, int(round(n * eval_fraction)))
+        for cause, n in quotas.items()
+    }
+
+    for seed in seeds:
+        rng = np.random.default_rng(seed)
+
+        train_parts = []
+        eval_parts = []
+
+        for site in sites:
+            for cause in classes:
+
+                candidates = research_df[
+                    (research_df[site_col] == site)
+                    & (research_df[target] == cause)
+                ]
+
+                selected = candidates.sample(
+                    n=quotas[cause],
+                    random_state=int(
+                        rng.integers(0, 2**31 - 1)
+                    )
+                )
+
+                shuffled = selected.sample(
+                    frac=1,
+                    random_state=int(
+                        rng.integers(0, 2**31 - 1)
+                    )
+                )
+
+                n_eval = eval_quotas[cause]
+
+                eval_parts.append(
+                    shuffled.iloc[:n_eval].copy()
+                )
+
+                train_parts.append(
+                    shuffled.iloc[n_eval:].copy()
+                )
+
+        train_df = pd.concat(
+            train_parts, ignore_index=True
+        )
+
+        eval_df = pd.concat(
+            eval_parts, ignore_index=True
+        )
+
+        # Validation
+        assert set(train_df["_row_id"]).isdisjoint(
+            eval_df["_row_id"]
+        )
+
+        assert train_df[site_col].nunique() == len(sites)
+        assert eval_df[site_col].nunique() == len(sites)
+
+        # Identical cause distributions across sites
+        assert (
+            pd.crosstab(train_df[target], train_df[site_col])
+            .nunique(axis=1) == 1
+        ).all()
+
+        assert (
+            pd.crosstab(eval_df[target], eval_df[site_col])
+            .nunique(axis=1) == 1
+        ).all()
+
+        yield {
+            "seed": seed,
+            "train": train_df,
+            "eval": eval_df,
+            "sites": sites,
+            "classes": classes
+        }
+
             
 if __name__ == "__main__":
     from sklearn.metrics import f1_score

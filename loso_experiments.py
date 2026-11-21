@@ -8,7 +8,7 @@ from hydra.core.hydra_config import HydraConfig
 from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.metrics import f1_score, accuracy_score
 
-from loso_sets import create_loso_sets, create_controlled_site_sets
+from loso_sets import create_loso_sets, create_controlled_site_sets, create_site_prediction_sets
 from logistic_regression import load_and_preprocess, create_LR_pipeline
 from train_baseline import create_SVM_pipeline
 from data_exploration import exploration_for_controlled_loso
@@ -250,6 +250,161 @@ def run_controlled_loso_experiment(cfg):
         index=False
     )
 
+
+def run_predict_site_exp(cfg):
+
+    train_df, dev_df,_ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df],ignore_index=True)
+    output_dir =  Path(HydraConfig.get().runtime.output_dir)
+
+    text_col = cfg.data.text_column
+    site_col = cfg.data.site_column
+
+    results = []
+    all_predictions = []
+    all_top_features = []
+
+    for fold in create_site_prediction_sets(cfg, research_df):
+
+        seed = fold["seed"]
+        train = fold["train"]
+        eval_df = fold["eval"]
+
+        print(f"\nSeed: {seed}")
+        print(f"Train: {len(train)}, Eval: {len(eval_df)}")
+
+        for filter_voc in [False, True]:
+
+            pipeline = create_LR_pipeline(with_SVD=False,OAA=False,filter_voc=filter_voc)
+            pipeline.set_params(clf__C=1.0)
+
+            pipeline.fit(train[text_col],train[site_col])
+            pred = pipeline.predict(eval_df[text_col])
+
+            site_f1 = f1_score(
+                eval_df[site_col],
+                pred,
+                labels=fold["sites"],
+                average="macro",
+                zero_division=0
+            )
+            site_accuracy = accuracy_score(eval_df[site_col],pred)
+
+            print(
+                f"Filtered={filter_voc}: "
+                f"F1={site_f1:.4f}, "
+                f"Accuracy={site_accuracy:.4f}"
+            )
+
+            # Save performance
+            results.append({
+                "seed": seed,
+                "filter_documentation": filter_voc,
+                "macro_f1": float(site_f1),
+                "accuracy": float(site_accuracy),
+                "train_size": len(train),
+                "eval_size": len(eval_df)
+            })
+
+            # Save individual predictions
+            prediction_df = pd.DataFrame({
+                "seed": seed,
+                "filter_documentation": filter_voc,
+                "site": eval_df[site_col].to_numpy(),
+                "module": eval_df["module"].to_numpy(),
+                "newid": eval_df["newid"].to_numpy(),
+                "row_id": eval_df["_row_id"].to_numpy(),
+                "predicted_site": pred
+            })
+
+            all_predictions.append(prediction_df)
+
+            # Inspect feature coefficients
+            tfidf = pipeline.named_steps["tfidf"]
+            clf = pipeline.named_steps["clf"]
+
+            feature_names = tfidf.get_feature_names_out()
+
+            for i, site in enumerate(clf.classes_):
+
+                top_idx = np.argsort(
+                    clf.coef_[i]
+                )[-15:][::-1]
+
+                for rank, idx in enumerate(top_idx, start=1):
+                    all_top_features.append({
+                        "seed": seed,
+                        "filter_documentation": filter_voc,
+                        "site": site,
+                        "rank": rank,
+                        "feature": feature_names[idx],
+                        "coefficient": float(clf.coef_[i, idx])
+                    })
+
+
+        # Save incrementally after each seed
+        pd.DataFrame(results).to_csv(
+            output_dir / "site_prediction_results.csv",
+            index=False
+        )
+
+        pd.concat(
+            all_predictions, ignore_index=True
+        ).to_csv(
+            output_dir / "site_prediction_predictions.csv",
+            index=False
+        )
+
+        pd.DataFrame(all_top_features).to_csv(
+            output_dir / "site_prediction_features.csv",
+            index=False
+        )
+
+    # Summary over all seeds
+    results_df = pd.DataFrame(results)
+
+    paired = results_df.pivot(
+        index="seed",
+        columns="filter_documentation",
+        values=["macro_f1", "accuracy"]
+    )
+
+    paired["delta_f1"] = (
+        paired[("macro_f1", True)]
+        - paired[("macro_f1", False)]
+    )
+
+    paired["delta_accuracy"] = (
+        paired[("accuracy", True)]
+        - paired[("accuracy", False)]
+    )
+    
+    print("\nFiltering effect:")
+    print(paired[["delta_f1", "delta_accuracy"]].mean())
+    print(paired[["delta_f1", "delta_accuracy"]].median())
+
+    summary = (
+        results_df.groupby("filter_documentation")
+        .agg(
+            mean_f1=("macro_f1", "mean"),
+            median_f1=("macro_f1", "median"),
+            std_f1=("macro_f1", "std"),
+            mean_accuracy=("accuracy", "mean"),
+            median_accuracy=("accuracy", "median"),
+            std_accuracy=("accuracy", "std"),
+            n_seeds=("seed", "nunique")
+        )
+        .reset_index()
+    )
+
+    summary.to_csv(output_dir / "site_prediction_summary.csv",index=False)
+
+    print("\nOverall summary:")
+    print(summary.to_string(index=False))
+
+    return results_df
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -258,6 +413,8 @@ def main(cfg: DictConfig):
         run_loso_experiments(cfg)
     elif exp == "loso_LR_controlled":
         run_controlled_loso_experiment(cfg)
+    elif exp == "site_prediction":
+        run_predict_site_exp(cfg)
     else:
         print("Please check experiment name in config")
 

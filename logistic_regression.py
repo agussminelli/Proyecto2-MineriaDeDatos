@@ -9,6 +9,7 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from simple_load_dataset import simple_load_dataset
 from divide_data import create_stratified_partitions
 from preprocess import preprocess_dataset
+from filter_voc import DocumentationFilter
 
 
 def load_and_preprocess(test=False, return_df=False):
@@ -237,7 +238,7 @@ def experiment_without_svd():
         )
 
 
-def create_LR_pipeline(cfg=None, with_SVD=True, OAA=True):
+def create_LR_pipeline(cfg=None, with_SVD=True, OAA=True, filter_voc=False):
 
     if cfg is not None:
         max_features=cfg.vectorizer.max_features
@@ -261,7 +262,11 @@ def create_LR_pipeline(cfg=None, with_SVD=True, OAA=True):
     if OAA:
         classifier = OneVsRestClassifier(classifier)
 
-    steps = [("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range,max_df=0.85,))]
+    steps = []
+    if filter_voc:
+        steps.append(("doc_filter", DocumentationFilter()))
+
+    steps.append(("tfidf", TfidfVectorizer(max_features=max_features,ngram_range=ngram_range,max_df=0.85,)))
     if with_SVD:
         steps.append(("svd",TruncatedSVD(n_components=n_components,random_state=random_state)))
     steps.append(("clf", classifier))

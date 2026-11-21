@@ -4,6 +4,7 @@ defaults:
 experiment:
   name: loso_LR_controlled
   adult_only: false
+  filter_voc: true
 
 controlled_loso:
   min_count: 10

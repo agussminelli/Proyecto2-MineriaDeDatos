@@ -17,6 +17,7 @@ from data_exploration import exploration_for_controlled_loso
 def run_loso_experiments(cfg: DictConfig):
 
     adult_only=cfg.experiment.adult_only
+    filter_voc=cfg.experiment.filter_voc
     text_c=cfg.data.text_column
     target_c=cfg.data.target_column
     site_c=cfg.data.site_column
@@ -55,7 +56,7 @@ def run_loso_experiments(cfg: DictConfig):
                 pipeline = create_SVM_pipeline(cfg)
                 c_param = "clf__C"
             else:
-                pipeline = create_LR_pipeline(with_SVD=with_SVD,OAA=OAA)
+                pipeline = create_LR_pipeline(with_SVD=with_SVD,OAA=OAA,filter_voc=filter_voc)
                 c_param = ("clf__estimator__C" if OAA else "clf__C")
 
             search = GridSearchCV(
@@ -173,6 +174,7 @@ def run_controlled_loso_experiment(cfg):
     train_df, dev_df,_ = load_and_preprocess(return_df=True)
     research_df = pd.concat([train_df, dev_df],ignore_index=True)
     output_dir =  Path(HydraConfig.get().runtime.output_dir)
+    filter_voc=cfg.experiment.filter_voc
 
     results = []
 
@@ -182,7 +184,7 @@ def run_controlled_loso_experiment(cfg):
             train = fold[f"train_{condition}"]
             eval_df = fold["eval"]
 
-            pipeline = create_LR_pipeline(with_SVD=False,OAA=False)
+            pipeline = create_LR_pipeline(with_SVD=False,OAA=False,filter_voc=filter_voc)
 
             pipeline.set_params(clf__C=1.0)
 
@@ -191,9 +193,7 @@ def run_controlled_loso_experiment(cfg):
                 train["gs_text34"]
             )
 
-            pred = pipeline.predict(
-                eval_df["open_response_clean"]
-            )
+            pred = pipeline.predict(eval_df["open_response_clean"])
 
             f1 = f1_score(
                 eval_df["gs_text34"],

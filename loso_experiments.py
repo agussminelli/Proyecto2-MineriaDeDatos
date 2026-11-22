@@ -437,27 +437,14 @@ def run_module_only_site_pred(cfg):
 def E2_autocut_top_site_features(cfg):
     """
     E2: Automatic removal of site-associated TF-IDF features.
-
-    Experiments:
-        E0      Original TF-IDF (reference)
-        E2_1pct Remove top 1% site-associated features
-        E2_2pct Remove top 2% site-associated features
-        E2_5pct Remove top 5% site-associated features
-
+    Thresholds: 1%,2%,5% and reference (0%)
     Evaluation:
         All modules, 14-class Leave-One-Site-Out
         Multinomial Logistic Regression, no SVD
         Fixed C=1.0
-
     Feature selection:
         Mutual Information(feature presence, site)
         Calculated ONLY on the five training sites.
-
-    CSV outputs:
-        e2_results.csv
-        e2_predictions.csv
-        e2_removed_features.csv
-        e2_summary.csv
     """
 
     train_df, dev_df, _ = load_and_preprocess(return_df=True)
@@ -731,6 +718,246 @@ def E2_autocut_top_site_features(cfg):
 
 
 
+def E3_autocut_site_cod_features(cfg):
+    """E3: Remove features with high Site MI and low CoD MI."""
+
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+    ordering_method = cfg.feature_filter.ordering_method
+    labels = sorted(research_df[target_c].unique())
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = [0.0, 0.01, 0.02, 0.05]
+    candidate_fraction = 0.10
+
+    results = []
+    all_predictions = []
+    all_removed_features = []
+
+    reference_pipeline = create_LR_pipeline(with_SVD=False, OAA=False)
+    base_classifier = clone(reference_pipeline.named_steps["clf"])
+    base_classifier.set_params(C=1.0)
+
+    for held_out_site, fold_train, fold_eval in create_loso_sets(cfg, research_df):
+        print(f"\n{'=' * 50}\nHELD-OUT SITE: {held_out_site}\n{'=' * 50}")
+
+        vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+        X_train = vectorizer.fit_transform(fold_train[text_c])
+        X_eval = vectorizer.transform(fold_eval[text_c])
+
+        y_train = fold_train[target_c].to_numpy()
+        y_eval = fold_eval[target_c].to_numpy()
+        sites_train = fold_train[site_c].to_numpy()
+
+        n_features = X_train.shape[1]
+        feature_names = vectorizer.get_feature_names_out()
+
+        X_binary = X_train.copy().tocsr()
+        X_binary.data[:] = 1.0
+
+        site_scores = mutual_info_classif(
+            X_binary, sites_train, discrete_features=True, random_state=42
+        )
+
+        cod_scores = mutual_info_classif(
+            X_binary, y_train, discrete_features=True, random_state=42
+        )
+
+        doc_frequency = np.asarray(X_binary.getnnz(axis=0)).ravel()
+
+        # Candidate pool: top 10% by Site MI
+        site_ranking = np.lexsort((np.arange(n_features), -site_scores))
+        n_candidates = max(1, int(np.ceil(n_features * candidate_fraction)))
+        candidates = site_ranking[:n_candidates]
+
+        if ordering_method == "cod_first":
+            # E3a: prioritize lowest CoD MI
+            print("E3a - CoD first")
+            candidate_order = np.lexsort((
+                candidates,
+                -site_scores[candidates],
+                cod_scores[candidates]
+            ))
+            ranking = candidates[candidate_order]
+
+        elif ordering_method == "site_first_protected":
+            print("E3b - Site first protected")
+            # E3b: protect the top 20% by CoD MI
+            protection_fraction = 0.20
+            n_protected = int(np.ceil(n_candidates * protection_fraction))
+
+            cod_ranking = np.lexsort((
+                candidates,
+                -cod_scores[candidates]
+            ))
+
+            protected_idx = candidates[cod_ranking[:n_protected]]
+            eligible_idx = candidates[~np.isin(candidates, protected_idx)]
+
+            # Among remaining features, prioritize highest Site MI
+            eligible_order = np.lexsort((
+                eligible_idx,
+                -site_scores[eligible_idx]
+            ))
+            ranking = eligible_idx[eligible_order]
+
+            max_remove = int(np.ceil(n_features * max(thresholds)))
+
+            if len(ranking) < max_remove:
+                raise ValueError(
+                    f"Only {len(ranking)} features available, "
+                    f"but {max_remove} are required."
+                )
+
+        else:
+            raise ValueError(f"Unknown E3 ordering method: {ordering_method}")
+
+        print(f"TF-IDF features: {n_features}, E3 candidates: {n_candidates}")
+
+        for threshold in thresholds:
+            experiment = "E0" if threshold == 0 else f"E3_{int(threshold * 100)}pct"
+            n_remove = 0 if threshold == 0 else max(1, int(np.ceil(n_features * threshold)))
+            removed_idx = ranking[:n_remove]
+
+            weights = np.ones(n_features, dtype=np.float64)
+            weights[removed_idx] = 0.0
+
+            X_train_filtered = X_train.multiply(weights).tocsr()
+            X_eval_filtered = X_eval.multiply(weights).tocsr()
+
+            classifier = clone(base_classifier)
+            classifier.fit(X_train_filtered, y_train)
+            predictions = classifier.predict(X_eval_filtered)
+
+            macro_f1 = f1_score(
+                y_eval, predictions, labels=labels, average="macro", zero_division=0
+            )
+            accuracy = accuracy_score(y_eval, predictions)
+
+            print(
+                f"{experiment}: Removed={len(removed_idx)}, "
+                f"Macro-F1={macro_f1:.4f}, Accuracy={accuracy:.4f}"
+            )
+
+            results.append({
+                "experiment": experiment,
+                "ordering_method": ordering_method,
+                "held_out_site": held_out_site,
+                "threshold": float(threshold),
+                "candidate_fraction": candidate_fraction,
+                "n_features": int(n_features),
+                "n_candidates": int(n_candidates),
+                "n_removed": int(len(removed_idx)),
+                "train_size": len(fold_train),
+                "eval_size": len(fold_eval),
+                "C": 1.0,
+                "macro_f1": float(macro_f1),
+                "accuracy": float(accuracy)
+            })
+
+            all_predictions.append(pd.DataFrame({
+                "experiment": experiment,
+                "held_out_site": held_out_site,
+                "site": fold_eval[site_c].to_numpy(),
+                "module": fold_eval["module"].to_numpy(),
+                "newid": fold_eval["newid"].to_numpy(),
+                "true_label": y_eval,
+                "predicted_label": predictions
+            }))
+
+            for rank, idx in enumerate(removed_idx, start=1):
+                all_removed_features.append({
+                    "experiment": experiment,
+                    "ordering_method": ordering_method,
+                    "held_out_site": held_out_site,
+                    "threshold": float(threshold),
+                    "rank": rank,
+                    "feature": feature_names[idx],
+                    "site_mi": float(site_scores[idx]),
+                    "cod_mi": float(cod_scores[idx]),
+                    "document_frequency": int(doc_frequency[idx]),
+                    "document_frequency_ratio": float(doc_frequency[idx] / len(fold_train))
+                })
+
+        # Incremental CSV saving
+        pd.DataFrame(results).to_csv(output_dir / "e3_results.csv", index=False)
+        pd.concat(all_predictions, ignore_index=True).to_csv(
+            output_dir / f"e3_{ordering_method}_predictions.csv", index=False
+        )
+        pd.DataFrame(all_removed_features).to_csv(
+            output_dir / f"e3_{ordering_method}_removed_features.csv", index=False
+        )
+
+    # Aggregate LOSO results
+    results_df = pd.DataFrame(results)
+    summary_rows = []
+
+    for experiment, group in results_df.groupby("experiment", sort=False):
+        experiment_predictions = pd.concat(
+            [df for df in all_predictions if df["experiment"].iloc[0] == experiment],
+            ignore_index=True
+        )
+
+        pooled_f1 = f1_score(
+            experiment_predictions["true_label"],
+            experiment_predictions["predicted_label"],
+            labels=labels, average="macro", zero_division=0
+        )
+
+        summary_rows.append({
+            "experiment": experiment,
+            "ordering_method": ordering_method,
+            "threshold": float(group["threshold"].iloc[0]),
+            "mean_loso_macro_f1": float(group["macro_f1"].mean()),
+            "median_loso_macro_f1": float(group["macro_f1"].median()),
+            "std_loso_macro_f1": float(group["macro_f1"].std(ddof=1)),
+            "pooled_loso_macro_f1": float(pooled_f1),
+            "mean_accuracy": float(group["accuracy"].mean()),
+            "n_sites": int(len(group))
+        })
+
+    summary = pd.DataFrame(summary_rows)
+
+    # Paired comparison against E0
+    baseline = results_df[results_df["experiment"] == "E0"][
+        ["held_out_site", "macro_f1", "accuracy"]
+    ].rename(columns={
+        "macro_f1": "baseline_f1",
+        "accuracy": "baseline_accuracy"
+    })
+
+    results_df = results_df.merge(
+        baseline, on="held_out_site", how="left", validate="many_to_one"
+    )
+
+    results_df["delta_f1_vs_E0"] = results_df["macro_f1"] - results_df["baseline_f1"]
+    results_df["delta_accuracy_vs_E0"] = results_df["accuracy"] - results_df["baseline_accuracy"]
+
+    mean_deltas = results_df.groupby("experiment")["delta_f1_vs_E0"].mean()
+    summary["delta_mean_f1_vs_E0"] = summary["experiment"].map(mean_deltas)
+
+    pooled_baseline = summary.loc[
+        summary["experiment"] == "E0", "pooled_loso_macro_f1"
+    ].iloc[0]
+    summary["delta_pooled_f1_vs_E0"] = summary["pooled_loso_macro_f1"] - pooled_baseline
+
+    results_df.to_csv(output_dir / f"e3_{ordering_method}_results.csv", index=False)
+    summary.to_csv(output_dir / f"e3_{ordering_method}_summary.csv", index=False)
+
+    print("\n" + "=" * 60)
+    print("E3 — FINAL LOSO SUMMARY")
+    print("=" * 60)
+    print(summary.to_string(index=False))
+
+    return results_df, summary
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -745,6 +972,8 @@ def main(cfg: DictConfig):
         run_module_only_site_pred(cfg)
     elif exp == "E2_autocut_top_site_features":
         E2_autocut_top_site_features(cfg)
+    elif exp == "E3_autocut_site_cod_features":
+        E3_autocut_site_cod_features(cfg)
     else:
         print("Please check experiment name in config")
 

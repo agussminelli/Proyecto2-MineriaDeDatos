@@ -2,9 +2,12 @@ defaults:
   - _self_
 
 experiment:
-  name: E2_autocut_top_site_features #module_influence_on_site #loso_LR_controlled #site_prediction #loso_LR
+  name: E3_autocut_site_cod_features #E2_autocut_top_site_features #module_influence_on_site #loso_LR_controlled #site_prediction #loso_LR
   adult_only: false
   filter_voc: false
+
+feature_filter:
+  ordering_method: site_first_protected #cod_first
 
 controlled_loso:
   min_count: 10

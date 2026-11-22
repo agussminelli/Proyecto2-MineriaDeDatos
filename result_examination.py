@@ -1,5 +1,6 @@
 import pandas as pd
 from pathlib import Path
+import numpy as np
 
 
 def compare_E2_E3(e2_path, e3_path, output_dir, n_examples=15):
@@ -68,10 +69,33 @@ def compare_E2_E3(e2_path, e3_path, output_dir, n_examples=15):
     return summary, examples
 
 
+def E5_output_diagnostic(e5_path):
+    df = pd.read_csv(e5_path)
+
+    df["df_ratio"] = (
+        np.maximum(df["e2_document_frequency"], df["random_document_frequency"])
+        / np.minimum(df["e2_document_frequency"], df["random_document_frequency"])
+    )
+
+    summary = df.groupby("threshold").agg(
+        mean_distance=("log_df_distance", "mean"),
+        median_distance=("log_df_distance", "median"),
+        p95_distance=("log_df_distance", lambda x: x.quantile(0.95)),
+        mean_df_ratio=("df_ratio", "mean"),
+        pct_within_20pct=("df_ratio", lambda x: 100 * (x <= 1.2).mean()),
+        pct_within_50pct=("df_ratio", lambda x: 100 * (x <= 1.5).mean())
+    )
+
+    print(summary.round(3))
+
+
 if __name__ == "__main__":
-    compare_E2_E3(
-        e2_path= "output/E2_autocut_top_site_features/2026-11-21_19-27-44/e2_removed_features.csv", #"outputs/YOUR_E2_RUN/e2_removed_features.csv",
-        e3_path= "output/E3_autocut_site_cod_features/2026-11-21_20-38-19/e3_removed_features.csv", #outputs/YOUR_E3_RUN/e3_removed_features.csv",
-        output_dir="output/feature_selection_analysis",
-        n_examples=15
+    # compare_E2_E3(
+    #     e2_path= "output/E2_autocut_top_site_features/2026-11-21_19-27-44/e2_removed_features.csv", #"outputs/YOUR_E2_RUN/e2_removed_features.csv",
+    #     e3_path= "output/E3_autocut_site_cod_features/2026-11-21_20-38-19/e3_removed_features.csv", #outputs/YOUR_E3_RUN/e3_removed_features.csv",
+    #     output_dir="output/feature_selection_analysis",
+    #     n_examples=15
+    # )
+    E5_output_diagnostic(
+        e5_path="output/E5_frequency_matched_random/2026-11-22_15-39-24/e5b_random_removed_features.csv",#outputs/YOUR_E5_RUN/e5_random_removed_features.csv"
     )

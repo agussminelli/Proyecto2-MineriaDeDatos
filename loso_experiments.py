@@ -958,6 +958,379 @@ def E3_autocut_site_cod_features(cfg):
     return results_df, summary
 
 
+def E5_frequency_matched_random(cfg, random_seed=42):
+    """E5b: Globally frequency-matched alternative feature removal."""
+
+    from scipy.optimize import linear_sum_assignment
+
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+    labels = sorted(research_df[target_c].unique())
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    e2_features_path=Path(cfg.feature_filter.e2_removed_features_path)
+    n_repeats=cfg.feature_filter.random_repeats
+
+    e2_features = pd.read_csv(e2_features_path)
+    thresholds = [0.01, 0.02, 0.05]
+    matching_jitter = 0.01
+
+    results = []
+    removed_records = []
+    pooled_predictions = {}
+
+    reference_pipeline = create_LR_pipeline(with_SVD=False, OAA=False)
+    base_classifier = clone(reference_pipeline.named_steps["clf"])
+    base_classifier.set_params(C=1.0)
+
+    def evaluate(X_train, X_eval, y_train, y_eval, removed_idx):
+        weights = np.ones(X_train.shape[1], dtype=np.float64)
+        weights[removed_idx] = 0.0
+
+        X_tr = X_train.multiply(weights).tocsr()
+        X_ev = X_eval.multiply(weights).tocsr()
+
+        classifier = clone(base_classifier)
+        classifier.fit(X_tr, y_train)
+        predictions = classifier.predict(X_ev)
+
+        macro_f1 = f1_score(
+            y_eval, predictions, labels=labels, average="macro", zero_division=0
+        )
+        accuracy = accuracy_score(y_eval, predictions)
+
+        return float(macro_f1), float(accuracy), predictions
+
+    def globally_matched_indices(e2_idx, doc_frequency, rng):
+        """Find a one-to-one minimum-cost matching, with randomized near-ties."""
+
+        all_idx = np.arange(len(doc_frequency))
+        available_idx = all_idx[~np.isin(all_idx, e2_idx)]
+
+        if len(available_idx) < len(e2_idx):
+            raise ValueError("Not enough alternative features for matching.")
+
+        target_log_df = np.log1p(doc_frequency[e2_idx])
+        available_log_df = np.log1p(doc_frequency[available_idx])
+
+        # Rows: E2 features; columns: eligible alternative features
+        true_cost = np.abs(
+            target_log_df[:, None] - available_log_df[None, :]
+        )
+
+        # Random perturbation creates alternative near-optimal matches.
+        noise = rng.uniform(
+            -matching_jitter, matching_jitter, size=true_cost.shape
+        )
+
+        row_idx, col_idx = linear_sum_assignment(true_cost + noise)
+        matched_idx = available_idx[col_idx]
+
+        matches = pd.DataFrame({
+            "e2_idx": e2_idx[row_idx],
+            "random_idx": matched_idx,
+            "log_df_distance": true_cost[row_idx, col_idx]
+        })
+
+        return matched_idx, matches
+    def matching_statistics(matches, doc_frequency):
+        e2_df = doc_frequency[matches["e2_idx"].to_numpy()]
+        random_df = doc_frequency[matches["random_idx"].to_numpy()]
+
+        ratios = np.maximum(e2_df, random_df) / np.minimum(e2_df, random_df)
+        distances = matches["log_df_distance"].to_numpy()
+
+        return {
+            "mean_log_df_distance": float(distances.mean()),
+            "median_log_df_distance": float(np.median(distances)),
+            "p95_log_df_distance": float(np.quantile(distances, 0.95)),
+            "mean_df_ratio": float(ratios.mean()),
+            "pct_within_20pct": float(100 * np.mean(ratios <= 1.2)),
+            "pct_within_50pct": float(100 * np.mean(ratios <= 1.5))
+        }
+
+    for site_index, (held_out_site, fold_train, fold_eval) in enumerate(
+        create_loso_sets(cfg, research_df)
+    ):
+        print(f"\n{'=' * 55}")
+        print(f"HELD-OUT SITE: {held_out_site}")
+        print(f"{'=' * 55}")
+
+        vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+        X_train = vectorizer.fit_transform(fold_train[text_c])
+        X_eval = vectorizer.transform(fold_eval[text_c])
+
+        y_train = fold_train[target_c].to_numpy()
+        y_eval = fold_eval[target_c].to_numpy()
+
+        feature_names = vectorizer.get_feature_names_out()
+        feature_lookup = {name: idx for idx, name in enumerate(feature_names)}
+        n_features = X_train.shape[1]
+
+        X_binary = X_train.copy().tocsr()
+        X_binary.data[:] = 1.0
+
+        doc_frequency = np.asarray(X_binary.getnnz(axis=0)).ravel()
+
+        site_scores = mutual_info_classif(
+            X_binary, fold_train[site_c].to_numpy(),
+            discrete_features=True, random_state=42
+        )
+
+        # E0 baseline
+        f1, accuracy, predictions = evaluate(
+            X_train, X_eval, y_train, y_eval, np.array([], dtype=int)
+        )
+
+        results.append({
+            "method": "E0", "held_out_site": held_out_site,
+            "threshold": 0.0, "repeat": -1, "n_removed": 0,
+            "macro_f1": f1, "accuracy": accuracy,
+            "mean_site_mi": np.nan,
+            "mean_log_df_distance": np.nan
+        })
+
+        pooled_predictions[("E0", 0.0, -1, held_out_site)] = (y_eval, predictions)
+        print(f"E0: Macro-F1={f1:.4f}")
+
+        for threshold in thresholds:
+            e2_rows = e2_features[
+                (e2_features["held_out_site"] == held_out_site)
+                & np.isclose(e2_features["threshold"], threshold)
+            ].sort_values("rank")
+
+            n_remove = int(np.ceil(n_features * threshold))
+
+            if len(e2_rows) != n_remove:
+                raise ValueError(
+                    f"{held_out_site}, {threshold}: Expected {n_remove} "
+                    f"E2 features, found {len(e2_rows)}."
+                )
+
+            missing = set(e2_rows["feature"]) - set(feature_lookup)
+            if missing:
+                raise ValueError(
+                    f"Vocabulary mismatch for {held_out_site}: {sorted(missing)[:10]}"
+                )
+
+            e2_idx = np.array(
+                [feature_lookup[name] for name in e2_rows["feature"]], dtype=int
+            )
+
+            if not np.array_equal(
+                doc_frequency[e2_idx], e2_rows["document_frequency"].to_numpy()
+            ):
+                raise ValueError(
+                    f"Document-frequency mismatch for {held_out_site}. "
+                    "Check preprocessing, splits and TF-IDF settings."
+                )
+
+            # Verify that E2's Site MI scores are reproducible
+            if not np.allclose(
+                site_scores[e2_idx], e2_rows["site_mi"].to_numpy(),
+                atol=1e-7, rtol=1e-5
+            ):
+                raise ValueError(f"Site MI mismatch for {held_out_site}.")
+
+            # E2 reference
+            f1, accuracy, predictions = evaluate(
+                X_train, X_eval, y_train, y_eval, e2_idx
+            )
+
+            results.append({
+                "method": "E2", "held_out_site": held_out_site,
+                "threshold": threshold, "repeat": -1,
+                "n_removed": n_remove, "macro_f1": f1,
+                "accuracy": accuracy,
+                "mean_site_mi": float(site_scores[e2_idx].mean()),
+                "mean_log_df_distance": 0.0
+            })
+
+            pooled_predictions[("E2", threshold, -1, held_out_site)] = (
+                y_eval, predictions
+            )
+
+            print(f"E2 {threshold:.0%}: Macro-F1={f1:.4f}")
+
+            random_scores = []
+            match_distances = []
+
+            for repeat in range(n_repeats):
+                seed = (
+                    random_seed + site_index * 100000
+                    + int(round(threshold * 1000)) * 1000 + repeat
+                )
+                rng = np.random.default_rng(seed)
+
+                random_idx, matches = globally_matched_indices(
+                    e2_idx, doc_frequency, rng
+                )
+
+                assert len(np.unique(random_idx)) == n_remove
+                assert not np.isin(random_idx, e2_idx).any()
+
+                match_stats = matching_statistics(matches, doc_frequency)
+
+                f1, accuracy, predictions = evaluate(
+                    X_train, X_eval, y_train, y_eval, random_idx
+                )
+
+                results.append({
+                    "method": "E5b", "held_out_site": held_out_site,
+                    "threshold": threshold, "repeat": repeat,
+                    "n_removed": n_remove, "macro_f1": f1,
+                    "accuracy": accuracy,
+                    "mean_site_mi": float(site_scores[random_idx].mean()),
+                    **match_stats
+                })
+
+                pooled_predictions[("E5b", threshold, repeat, held_out_site)] = (
+                    y_eval, predictions
+                )
+
+                random_scores.append(f1)
+                match_distances.append(match_stats["mean_log_df_distance"])
+
+                for row in matches.itertuples(index=False):
+                    removed_records.append({
+                        "held_out_site": held_out_site,
+                        "threshold": threshold,
+                        "repeat": repeat,
+                        "e2_feature": feature_names[row.e2_idx],
+                        "random_feature": feature_names[row.random_idx],
+                        "e2_document_frequency": int(doc_frequency[row.e2_idx]),
+                        "random_document_frequency": int(doc_frequency[row.random_idx]),
+                        "e2_site_mi": float(site_scores[row.e2_idx]),
+                        "random_site_mi": float(site_scores[row.random_idx]),
+                        "log_df_distance": float(row.log_df_distance)
+                    })
+
+            print(
+                f"E5b {threshold:.0%}: Mean F1={np.mean(random_scores):.4f}, "
+                f"Std={np.std(random_scores, ddof=1):.4f}, "
+                f"Mean match distance={np.mean(match_distances):.4f}"
+            )
+
+        pd.DataFrame(results).to_csv(
+            output_dir / "e5b_results.csv", index=False
+        )
+        pd.DataFrame(removed_records).to_csv(
+            output_dir / "e5b_random_removed_features.csv", index=False
+        )
+
+    results_df = pd.DataFrame(results)
+    site_rows = []
+    summary_rows = []
+
+    sites = sorted(results_df["held_out_site"].unique())
+    baseline_mean = results_df[
+        results_df["method"] == "E0"
+    ]["macro_f1"].mean()
+
+    for site in sites:
+        baseline = results_df[
+            (results_df["held_out_site"] == site)
+            & (results_df["method"] == "E0")
+        ]["macro_f1"].iloc[0]
+
+        for threshold in thresholds:
+            subset = results_df[
+                (results_df["held_out_site"] == site)
+                & (results_df["threshold"] == threshold)
+            ]
+
+            e2_row = subset[subset["method"] == "E2"].iloc[0]
+            random_rows = subset[subset["method"] == "E5b"]
+
+            site_rows.append({
+                "held_out_site": site,
+                "threshold": threshold,
+                "baseline_f1": baseline,
+                "e2_f1": e2_row["macro_f1"],
+                "e2_delta_vs_E0": e2_row["macro_f1"] - baseline,
+                "random_mean_f1": random_rows["macro_f1"].mean(),
+                "random_std_f1": random_rows["macro_f1"].std(ddof=1),
+                "random_delta_vs_E0": random_rows["macro_f1"].mean() - baseline,
+                "e2_minus_random": e2_row["macro_f1"] - random_rows["macro_f1"].mean(),
+                "e2_mean_site_mi": e2_row["mean_site_mi"],
+                "random_mean_site_mi": random_rows["mean_site_mi"].mean(),
+                "mean_log_df_distance": random_rows["mean_log_df_distance"].mean(),
+                "pct_within_20pct": random_rows["pct_within_20pct"].mean(),
+                "pct_within_50pct": random_rows["pct_within_50pct"].mean()
+            })
+
+    for threshold in thresholds:
+        subset = results_df[results_df["threshold"] == threshold]
+        e2_rows = subset[subset["method"] == "E2"]
+        random_rows = subset[subset["method"] == "E5b"]
+
+        repeat_means = random_rows.groupby("repeat")["macro_f1"].mean()
+        e2_mean = e2_rows["macro_f1"].mean()
+
+        e2_pairs = [
+            pooled_predictions[("E2", threshold, -1, site)] for site in sites
+        ]
+        e2_pooled = f1_score(
+            np.concatenate([pair[0] for pair in e2_pairs]),
+            np.concatenate([pair[1] for pair in e2_pairs]),
+            labels=labels, average="macro", zero_division=0
+        )
+
+        random_pooled = []
+        for repeat in range(n_repeats):
+            pairs = [
+                pooled_predictions[("E5b", threshold, repeat, site)]
+                for site in sites
+            ]
+            random_pooled.append(f1_score(
+                np.concatenate([pair[0] for pair in pairs]),
+                np.concatenate([pair[1] for pair in pairs]),
+                labels=labels, average="macro", zero_division=0
+            ))
+
+        summary_rows.append({
+            "threshold": threshold,
+            "n_repeats": n_repeats,
+            "e0_mean_loso_f1": baseline_mean,
+            "e2_mean_loso_f1": e2_mean,
+            "random_mean_loso_f1": repeat_means.mean(),
+            "random_std_loso_f1": repeat_means.std(ddof=1),
+            "e2_minus_random_mean_f1": e2_mean - repeat_means.mean(),
+            "e2_pooled_f1": e2_pooled,
+            "random_mean_pooled_f1": np.mean(random_pooled),
+            "e2_minus_random_pooled_f1": e2_pooled - np.mean(random_pooled),
+            "random_fraction_at_least_E2": float((repeat_means >= e2_mean).mean()),
+            "e2_mean_site_mi": e2_rows["mean_site_mi"].mean(),
+            "random_mean_site_mi": random_rows["mean_site_mi"].mean(),
+            "mean_log_df_distance": random_rows["mean_log_df_distance"].mean(),
+            "median_log_df_distance": random_rows["median_log_df_distance"].mean(),
+            "p95_log_df_distance": random_rows["p95_log_df_distance"].mean(),
+            "pct_within_20pct": random_rows["pct_within_20pct"].mean(),
+            "pct_within_50pct": random_rows["pct_within_50pct"].mean()
+        })
+
+    site_comparison = pd.DataFrame(site_rows)
+    summary = pd.DataFrame(summary_rows)
+
+    site_comparison.to_csv(
+        output_dir / "e5b_site_comparison.csv", index=False
+    )
+    summary.to_csv(output_dir / "e5b_summary.csv", index=False)
+
+    print("\n" + "=" * 60)
+    print("E5b — GLOBAL FREQUENCY-MATCHED RANDOM CONTROL")
+    print("=" * 60)
+    print(summary.round(5).to_string(index=False))
+
+    return results_df, site_comparison, summary
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -974,6 +1347,8 @@ def main(cfg: DictConfig):
         E2_autocut_top_site_features(cfg)
     elif exp == "E3_autocut_site_cod_features":
         E3_autocut_site_cod_features(cfg)
+    elif exp == "E5_frequency_matched_random":
+        E5_frequency_matched_random(cfg)
     else:
         print("Please check experiment name in config")
 

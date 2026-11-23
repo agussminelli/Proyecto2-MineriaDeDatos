@@ -1592,6 +1592,332 @@ def E_seen_feature_comparison(cfg):
     return results_df, summary
 
 
+def E4_feature_downweighting(cfg):
+    """E4: Compare feature removal and downweighting for Seen and Unseen sites."""
+
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+
+    labels = sorted(research_df[target_c].unique())
+    thresholds = [0.01, 0.02, 0.05]
+    weights_to_test = [0.0, 0.25, 0.50]
+
+    candidate_fraction = 0.10
+    protection_fraction = 0.20
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    prediction_frames = []
+    feature_records = []
+
+    reference_pipeline = create_LR_pipeline(with_SVD=False, OAA=False)
+
+    classifier_template = clone(reference_pipeline.named_steps["clf"])
+    classifier_template.set_params(C=1.0)
+
+    def evaluate_fold(mode, held_out_site, fold_train, fold_eval):
+        print(f"\n{'=' * 60}")
+        print(f"E4 — {mode}: {held_out_site}")
+        print(f"{'=' * 60}")
+
+        vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+        X_train = vectorizer.fit_transform(fold_train[text_c])
+        X_eval = vectorizer.transform(fold_eval[text_c])
+
+        y_train = fold_train[target_c].to_numpy()
+        y_eval = fold_eval[target_c].to_numpy()
+        sites_train = fold_train[site_c].to_numpy()
+        sites_eval = fold_eval[site_c].to_numpy()
+
+        n_features = X_train.shape[1]
+        feature_names = vectorizer.get_feature_names_out()
+
+        X_binary = X_train.copy().tocsr()
+        X_binary.data[:] = 1.0
+
+        site_scores = mutual_info_classif(
+            X_binary, sites_train, discrete_features=True, random_state=42
+        )
+
+        cod_scores = mutual_info_classif(
+            X_binary, y_train, discrete_features=True, random_state=42
+        )
+
+        doc_frequency = np.asarray(X_binary.getnnz(axis=0)).ravel()
+
+        # E2: highest Site MI first
+        site_ranking = np.lexsort((np.arange(n_features), -site_scores))
+
+        # E3b: top 10% Site MI, protect top 20% CoD MI
+        n_candidates = max(1, int(np.ceil(n_features * candidate_fraction)))
+        candidates = site_ranking[:n_candidates]
+
+        n_protected = int(np.ceil(n_candidates * protection_fraction))
+        cod_order = np.lexsort((candidates, -cod_scores[candidates]))
+        protected_idx = candidates[cod_order[:n_protected]]
+
+        eligible_idx = candidates[~np.isin(candidates, protected_idx)]
+        eligible_order = np.lexsort((eligible_idx, -site_scores[eligible_idx]))
+        e3b_ranking = eligible_idx[eligible_order]
+
+        rankings = {"E2": site_ranking, "E3b": e3b_ranking}
+
+        max_remove = int(np.ceil(n_features * max(thresholds)))
+        if any(len(ranking) < max_remove for ranking in rankings.values()):
+            raise ValueError("Not enough eligible features for E4 removal budgets.")
+
+        print(
+            f"Train={len(fold_train)}, Eval={len(fold_eval)}, "
+            f"Features={n_features}"
+        )
+
+        def fit_and_record(method, threshold, weight, selected_idx):
+            feature_weights = np.ones(n_features, dtype=np.float64)
+            feature_weights[selected_idx] = weight
+
+            X_tr = X_train.multiply(feature_weights).tocsr()
+            X_ev = X_eval.multiply(feature_weights).tocsr()
+
+            classifier = clone(classifier_template)
+            classifier.fit(X_tr, y_train)
+            predicted = classifier.predict(X_ev)
+
+            experiment = (
+                "E0" if method == "E0"
+                else f"{method}_{int(round(threshold * 100))}pct_w{weight:.2f}"
+            )
+
+            prediction_frames.append(pd.DataFrame({
+                "mode": mode,
+                "held_out_site": held_out_site,
+                "experiment": experiment,
+                "method": method,
+                "threshold": threshold,
+                "weight": weight,
+                "site": sites_eval,
+                "module": fold_eval["module"].to_numpy(),
+                "newid": fold_eval["newid"].to_numpy(),
+                "true_label": y_eval,
+                "predicted_label": predicted
+            }))
+
+            # For Seen: ALL plus a separate score for each familiar site
+            # For Unseen: evaluate the single held-out geographical site
+            evaluation_groups = (
+                [("ALL", np.ones(len(y_eval), dtype=bool))]
+                + [(site, sites_eval == site) for site in sorted(np.unique(sites_eval))]
+                if mode == "Seen"
+                else [(held_out_site, np.ones(len(y_eval), dtype=bool))]
+            )
+
+            for eval_site, mask in evaluation_groups:
+                macro_f1 = f1_score(
+                    y_eval[mask], predicted[mask],
+                    labels=labels, average="macro", zero_division=0
+                )
+                accuracy = accuracy_score(y_eval[mask], predicted[mask])
+
+                results.append({
+                    "mode": mode,
+                    "held_out_site": held_out_site,
+                    "eval_site": eval_site,
+                    "experiment": experiment,
+                    "method": method,
+                    "threshold": threshold,
+                    "weight": weight,
+                    "n_features": n_features,
+                    "n_selected": len(selected_idx),
+                    "train_size": len(fold_train),
+                    "eval_size": int(mask.sum()),
+                    "C": 1.0,
+                    "macro_f1": float(macro_f1),
+                    "accuracy": float(accuracy)
+                })
+
+                if eval_site == "ALL" or mode == "Unseen":
+                    print(
+                        f"{experiment}: Macro-F1={macro_f1:.4f}, "
+                        f"Accuracy={accuracy:.4f}"
+                    )
+
+        # Baseline E0
+        fit_and_record("E0", 0.0, 1.0, np.array([], dtype=int))
+
+        # E2 and E3b, with identical feature sets across weights
+        for method, ranking in rankings.items():
+            for threshold in thresholds:
+                n_select = max(1, int(np.ceil(n_features * threshold)))
+                selected_idx = ranking[:n_select]
+
+                for rank, idx in enumerate(selected_idx, start=1):
+                    feature_records.append({
+                        "mode": mode,
+                        "held_out_site": held_out_site,
+                        "method": method,
+                        "threshold": threshold,
+                        "rank": rank,
+                        "feature": feature_names[idx],
+                        "site_mi": float(site_scores[idx]),
+                        "cod_mi": float(cod_scores[idx]),
+                        "document_frequency": int(doc_frequency[idx])
+                    })
+
+                for weight in weights_to_test:
+                    fit_and_record(method, threshold, weight, selected_idx)
+
+        # Incremental saving after each complete fold
+        pd.DataFrame(results).to_csv(
+            output_dir / "e4_results.csv", index=False
+        )
+        pd.concat(prediction_frames, ignore_index=True).to_csv(
+            output_dir / "e4_predictions.csv", index=False
+        )
+        pd.DataFrame(feature_records).to_csv(
+            output_dir / "e4_selected_features.csv", index=False
+        )
+
+    # Six Unseen folds
+    for held_out_site, fold_train, fold_eval in create_loso_sets(cfg, research_df):
+        evaluate_fold("Unseen", held_out_site, fold_train, fold_eval)
+
+    # One Seen evaluation: original train/dev partition
+    evaluate_fold("Seen", "ALL", train_df, dev_df)
+
+    results_df = pd.DataFrame(results)
+    predictions_df = pd.concat(prediction_frames, ignore_index=True)
+
+    # Paired differences against E0 within each mode and evaluation site
+    baseline = results_df[results_df["method"] == "E0"][
+        ["mode", "eval_site", "macro_f1", "accuracy"]
+    ].rename(columns={
+        "macro_f1": "baseline_f1",
+        "accuracy": "baseline_accuracy"
+    })
+
+    results_df = results_df.merge(
+        baseline, on=["mode", "eval_site"], how="left", validate="many_to_one"
+    )
+
+    results_df["delta_f1_vs_E0"] = results_df["macro_f1"] - results_df["baseline_f1"]
+    results_df["delta_accuracy_vs_E0"] = (
+        results_df["accuracy"] - results_df["baseline_accuracy"]
+    )
+
+    summary_rows = []
+
+    for mode in ["Unseen", "Seen"]:
+        mode_results = results_df[results_df["mode"] == mode]
+        mode_predictions = predictions_df[predictions_df["mode"] == mode]
+
+        for experiment, group in mode_results.groupby("experiment", sort=False):
+            if mode == "Seen":
+                overall = group[group["eval_site"] == "ALL"].iloc[0]
+                site_group = group[group["eval_site"] != "ALL"]
+                overall_f1 = float(overall["macro_f1"])
+                overall_accuracy = float(overall["accuracy"])
+            else:
+                site_group = group
+                experiment_predictions = mode_predictions[
+                    mode_predictions["experiment"] == experiment
+                ]
+
+                overall_f1 = float(f1_score(
+                    experiment_predictions["true_label"],
+                    experiment_predictions["predicted_label"],
+                    labels=labels, average="macro", zero_division=0
+                ))
+                overall_accuracy = float(accuracy_score(
+                    experiment_predictions["true_label"],
+                    experiment_predictions["predicted_label"]
+                ))
+
+            summary_rows.append({
+                "mode": mode,
+                "experiment": experiment,
+                "method": group["method"].iloc[0],
+                "threshold": float(group["threshold"].iloc[0]),
+                "weight": float(group["weight"].iloc[0]),
+                "mean_site_macro_f1": float(site_group["macro_f1"].mean()),
+                "median_site_macro_f1": float(site_group["macro_f1"].median()),
+                "std_site_macro_f1": float(site_group["macro_f1"].std(ddof=1)),
+                "pooled_macro_f1": overall_f1,
+                "pooled_accuracy": overall_accuracy,
+                "mean_site_accuracy": float(site_group["accuracy"].mean()),
+                "n_sites_improved": int((site_group["delta_f1_vs_E0"] > 0).sum()),
+                "n_sites_degraded": int((site_group["delta_f1_vs_E0"] < 0).sum()),
+                "n_sites": len(site_group)
+            })
+
+    summary = pd.DataFrame(summary_rows)
+
+    # Calculate baseline differences separately for Seen and Unseen
+    for mode in ["Seen", "Unseen"]:
+        mask = summary["mode"] == mode
+        baseline_row = summary[mask & (summary["method"] == "E0")].iloc[0]
+
+        summary.loc[mask, "delta_mean_site_f1_vs_E0"] = (
+            summary.loc[mask, "mean_site_macro_f1"]
+            - baseline_row["mean_site_macro_f1"]
+        )
+
+        summary.loc[mask, "delta_pooled_f1_vs_E0"] = (
+            summary.loc[mask, "pooled_macro_f1"]
+            - baseline_row["pooled_macro_f1"]
+        )
+
+        summary.loc[mask, "delta_pooled_accuracy_vs_E0"] = (
+            summary.loc[mask, "pooled_accuracy"]
+            - baseline_row["pooled_accuracy"]
+        )
+
+    # Compare downweighting directly against complete removal
+    removal_baselines = summary[
+        (summary["method"] != "E0") & (summary["weight"] == 0.0)
+    ][[
+        "mode", "method", "threshold",
+        "mean_site_macro_f1", "pooled_macro_f1"
+    ]].rename(columns={
+        "mean_site_macro_f1": "removal_mean_site_f1",
+        "pooled_macro_f1": "removal_pooled_f1"
+    })
+
+    summary = summary.merge(
+        removal_baselines, on=["mode", "method", "threshold"],
+        how="left", validate="many_to_one"
+    )
+
+    summary["delta_mean_site_f1_vs_removal"] = (
+        summary["mean_site_macro_f1"] - summary["removal_mean_site_f1"]
+    )
+    summary["delta_pooled_f1_vs_removal"] = (
+        summary["pooled_macro_f1"] - summary["removal_pooled_f1"]
+    )
+
+    # Save final CSV files
+    results_df.to_csv(output_dir / "e4_results.csv", index=False)
+    summary.to_csv(output_dir / "e4_summary.csv", index=False)
+
+    print("\n" + "=" * 75)
+    print("E4 — FINAL SEEN / UNSEEN SUMMARY")
+    print("=" * 75)
+
+    display_columns = [
+        "mode", "experiment", "mean_site_macro_f1",
+        "delta_mean_site_f1_vs_E0", "pooled_macro_f1",
+        "delta_pooled_f1_vs_E0", "delta_pooled_f1_vs_removal"
+    ]
+
+    print(summary[display_columns].round(5).to_string(index=False))
+
+    return results_df, summary
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -1612,6 +1938,8 @@ def main(cfg: DictConfig):
         E5_frequency_matched_random(cfg)
     elif exp == "E_seen_feature_comparison":
         E_seen_feature_comparison(cfg)
+    elif exp == "E4_feature_downweighting":
+        E4_feature_downweighting(cfg)
     else:
         print("Please check experiment name in config")
 

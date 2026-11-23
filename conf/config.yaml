@@ -2,7 +2,8 @@ defaults:
   - _self_
 
 experiment:
-  name: E5_frequency_matched_random 
+  name: E_seen_feature_comparison
+        #E5_frequency_matched_random 
         #E3_autocut_site_cod_features 
         #E2_autocut_top_site_features 
         #module_influence_on_site 

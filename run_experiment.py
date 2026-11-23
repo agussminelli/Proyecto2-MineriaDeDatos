@@ -1331,6 +1331,267 @@ def E5_frequency_matched_random(cfg, random_seed=42):
     return results_df, site_comparison, summary
 
 
+def E_seen_feature_comparison(cfg):
+    """Seen-site evaluation: E0, E2, E3a and E3b on train/dev."""
+
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+
+    labels = sorted(pd.concat([train_df[target_c], dev_df[target_c]]).unique())
+    sites = sorted(dev_df[site_c].unique())
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = [0.01, 0.02, 0.05]
+    candidate_fraction = 0.10
+    protection_fraction = 0.20
+
+    results = []
+    predictions_records = []
+    removed_records = []
+
+    reference_pipeline = create_LR_pipeline(with_SVD=False, OAA=False)
+
+    vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+    classifier_template = clone(reference_pipeline.named_steps["clf"])
+    classifier_template.set_params(C=1.0)
+
+    X_train = vectorizer.fit_transform(train_df[text_c])
+    X_dev = vectorizer.transform(dev_df[text_c])
+
+    y_train = train_df[target_c].to_numpy()
+    y_dev = dev_df[target_c].to_numpy()
+    train_sites = train_df[site_c].to_numpy()
+    dev_sites = dev_df[site_c].to_numpy()
+
+    n_features = X_train.shape[1]
+    feature_names = vectorizer.get_feature_names_out()
+
+    print(f"\nSeen comparison: Train={len(train_df)}, Dev={len(dev_df)}")
+    print(f"TF-IDF features: {n_features}")
+
+    # Feature scores use ONLY the original training partition
+    X_binary = X_train.copy().tocsr()
+    X_binary.data[:] = 1.0
+
+    site_scores = mutual_info_classif(
+        X_binary, train_sites, discrete_features=True, random_state=42
+    )
+
+    cod_scores = mutual_info_classif(
+        X_binary, y_train, discrete_features=True, random_state=42
+    )
+
+    doc_frequency = np.asarray(X_binary.getnnz(axis=0)).ravel()
+
+    # E2: Descending Site MI
+    site_ranking = np.lexsort((np.arange(n_features), -site_scores))
+
+    # E3a: CoD-first ranking within top 10% Site MI candidates
+    n_candidates = max(1, int(np.ceil(n_features * candidate_fraction)))
+    candidates = site_ranking[:n_candidates]
+
+    cod_first_order = np.lexsort((
+        candidates,
+        -site_scores[candidates],
+        cod_scores[candidates]
+    ))
+    e3a_ranking = candidates[cod_first_order]
+
+    # E3b: Protect top 20% CoD-MI candidates, then rank by Site MI
+    n_protected = int(np.ceil(n_candidates * protection_fraction))
+
+    cod_ranking = np.lexsort((
+        candidates,
+        -cod_scores[candidates]
+    ))
+    protected_idx = candidates[cod_ranking[:n_protected]]
+    eligible_idx = candidates[~np.isin(candidates, protected_idx)]
+
+    eligible_order = np.lexsort((
+        eligible_idx,
+        -site_scores[eligible_idx]
+    ))
+    e3b_ranking = eligible_idx[eligible_order]
+
+    rankings = {
+        "E2": site_ranking,
+        "E3a": e3a_ranking,
+        "E3b": e3b_ranking
+    }
+
+    max_remove = int(np.ceil(n_features * max(thresholds)))
+    if any(len(ranking) < max_remove for ranking in rankings.values()):
+        raise ValueError("Insufficient candidate features for removal budgets.")
+
+    def evaluate(experiment, threshold, removed_idx):
+        weights = np.ones(n_features, dtype=np.float64)
+        weights[removed_idx] = 0.0
+
+        X_train_filtered = X_train.multiply(weights).tocsr()
+        X_dev_filtered = X_dev.multiply(weights).tocsr()
+
+        classifier = clone(classifier_template)
+        classifier.fit(X_train_filtered, y_train)
+        predicted = classifier.predict(X_dev_filtered)
+
+        overall_f1 = f1_score(
+            y_dev, predicted, labels=labels, average="macro", zero_division=0
+        )
+        overall_accuracy = accuracy_score(y_dev, predicted)
+
+        print(
+            f"{experiment}: Removed={len(removed_idx)}, "
+            f"Macro-F1={overall_f1:.4f}, Accuracy={overall_accuracy:.4f}"
+        )
+
+        # Overall results
+        results.append({
+            "experiment": experiment,
+            "site": "ALL",
+            "threshold": threshold,
+            "n_features": n_features,
+            "n_removed": len(removed_idx),
+            "train_size": len(train_df),
+            "eval_size": len(dev_df),
+            "C": 1.0,
+            "macro_f1": float(overall_f1),
+            "accuracy": float(overall_accuracy)
+        })
+
+        # Per-site results: one global model evaluated on each familiar site
+        for site in sites:
+            mask = dev_sites == site
+
+            site_f1 = f1_score(
+                y_dev[mask], predicted[mask],
+                labels=labels, average="macro", zero_division=0
+            )
+
+            site_accuracy = accuracy_score(y_dev[mask], predicted[mask])
+
+            results.append({
+                "experiment": experiment,
+                "site": site,
+                "threshold": threshold,
+                "n_features": n_features,
+                "n_removed": len(removed_idx),
+                "train_size": len(train_df),
+                "eval_size": int(mask.sum()),
+                "C": 1.0,
+                "macro_f1": float(site_f1),
+                "accuracy": float(site_accuracy)
+            })
+
+        predictions_records.append(pd.DataFrame({
+            "experiment": experiment,
+            "threshold": threshold,
+            "site": dev_sites,
+            "module": dev_df["module"].to_numpy(),
+            "newid": dev_df["newid"].to_numpy(),
+            "true_label": y_dev,
+            "predicted_label": predicted
+        }))
+
+        # Removed vocabulary and feature information
+        for rank, idx in enumerate(removed_idx, start=1):
+            removed_records.append({
+                "experiment": experiment,
+                "threshold": threshold,
+                "rank": rank,
+                "feature": feature_names[idx],
+                "site_mi": float(site_scores[idx]),
+                "cod_mi": float(cod_scores[idx]),
+                "document_frequency": int(doc_frequency[idx]),
+                "document_frequency_ratio": float(
+                    doc_frequency[idx] / len(train_df)
+                )
+            })
+
+    # E0 baseline
+    evaluate("E0", 0.0, np.array([], dtype=int))
+
+    # E2, E3a and E3b at equal removal budgets
+    for method, ranking in rankings.items():
+        print(f"\n{'=' * 50}\n{method}\n{'=' * 50}")
+
+        for threshold in thresholds:
+            n_remove = max(1, int(np.ceil(n_features * threshold)))
+            experiment = f"{method}_{int(round(threshold * 100))}pct"
+            removed_idx = ranking[:n_remove]
+
+            evaluate(experiment, threshold, removed_idx)
+
+        # Incremental saving
+        pd.DataFrame(results).to_csv(
+            output_dir / "seen_results.csv", index=False
+        )
+        pd.concat(predictions_records, ignore_index=True).to_csv(
+            output_dir / "seen_predictions.csv", index=False
+        )
+        pd.DataFrame(removed_records).to_csv(
+            output_dir / "seen_removed_features.csv", index=False
+        )
+
+    # Paired differences versus E0, separately for each site
+    results_df = pd.DataFrame(results)
+
+    baseline = results_df[results_df["experiment"] == "E0"][
+        ["site", "macro_f1", "accuracy"]
+    ].rename(columns={
+        "macro_f1": "baseline_f1",
+        "accuracy": "baseline_accuracy"
+    })
+
+    results_df = results_df.merge(
+        baseline, on="site", how="left", validate="many_to_one"
+    )
+
+    results_df["delta_f1_vs_E0"] = (
+        results_df["macro_f1"] - results_df["baseline_f1"]
+    )
+    results_df["delta_accuracy_vs_E0"] = (
+        results_df["accuracy"] - results_df["baseline_accuracy"]
+    )
+
+    # Summary: global dev score and equal-weight mean across six sites
+    summary_rows = []
+
+    for experiment, group in results_df.groupby("experiment", sort=False):
+        overall = group[group["site"] == "ALL"].iloc[0]
+        per_site = group[group["site"] != "ALL"]
+
+        summary_rows.append({
+            "experiment": experiment,
+            "threshold": float(overall["threshold"]),
+            "overall_macro_f1": float(overall["macro_f1"]),
+            "overall_accuracy": float(overall["accuracy"]),
+            "delta_overall_f1_vs_E0": float(overall["delta_f1_vs_E0"]),
+            "mean_site_macro_f1": float(per_site["macro_f1"].mean()),
+            "median_site_macro_f1": float(per_site["macro_f1"].median()),
+            "std_site_macro_f1": float(per_site["macro_f1"].std(ddof=1)),
+            "delta_mean_site_f1_vs_E0": float(per_site["delta_f1_vs_E0"].mean()),
+            "n_sites_improved": int((per_site["delta_f1_vs_E0"] > 0).sum()),
+            "n_sites_degraded": int((per_site["delta_f1_vs_E0"] < 0).sum())
+        })
+
+    summary = pd.DataFrame(summary_rows)
+
+    results_df.to_csv(output_dir / "seen_results.csv", index=False)
+    summary.to_csv(output_dir / "seen_summary.csv", index=False)
+
+    print("\n" + "=" * 60)
+    print("SEEN — FINAL SUMMARY")
+    print("=" * 60)
+    print(summary.round(5).to_string(index=False))
+
+    return results_df, summary
+
+
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
 
@@ -1349,6 +1610,8 @@ def main(cfg: DictConfig):
         E3_autocut_site_cod_features(cfg)
     elif exp == "E5_frequency_matched_random":
         E5_frequency_matched_random(cfg)
+    elif exp == "E_seen_feature_comparison":
+        E_seen_feature_comparison(cfg)
     else:
         print("Please check experiment name in config")
 

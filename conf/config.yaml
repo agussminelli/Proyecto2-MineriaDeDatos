@@ -2,7 +2,8 @@ defaults:
   - _self_
 
 experiment:
-  name: E4_feature_downweighting
+  name: loso_LR_controlled_E4
+        #E4_feature_downweighting
         #E_seen_feature_comparison
         #E5_frequency_matched_random 
         #E3_autocut_site_cod_features 

@@ -171,86 +171,230 @@ def run_loso_experiments(cfg: DictConfig):
     return pd.DataFrame(results)
 
 
-def run_controlled_loso_experiment(cfg):
+def run_controlled_loso_experiment(cfg, apply_site_weighting=False):
+    """Controlled 5-class LOSO, optionally comparing E0 with E4."""
 
-    train_df, dev_df,_ = load_and_preprocess(return_df=True)
-    research_df = pd.concat([train_df, dev_df],ignore_index=True)
-    output_dir =  Path(HydraConfig.get().runtime.output_dir)
-    filter_voc=cfg.experiment.filter_voc
+    train_df, dev_df, _ = load_and_preprocess(return_df=True)
+    research_df = pd.concat([train_df, dev_df], ignore_index=True)
+
+    text_c = cfg.data.text_column
+    target_c = cfg.data.target_column
+    site_c = cfg.data.site_column
+
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fraction = 0.02
+    feature_weight = 0.50
 
     results = []
+    prediction_frames = []
+    selected_feature_rows = []
 
-    for fold in create_controlled_site_sets(cfg, research_df):
-
-        for condition in ["seen", "unseen"]:
-            train = fold[f"train_{condition}"]
-            eval_df = fold["eval"]
-
-            pipeline = create_LR_pipeline(with_SVD=False,OAA=False,filter_voc=filter_voc)
-
-            pipeline.set_params(clf__C=1.0)
-
-            pipeline.fit(
-                train["open_response_clean"],
-                train["gs_text34"]
-            )
-
-            pred = pipeline.predict(eval_df["open_response_clean"])
-
-            f1 = f1_score(
-                eval_df["gs_text34"],
-                pred,
-                labels=fold["classes"],
-                average="macro",
-                zero_division=0
-            )
-
-            results.append({
-                "seed": fold["seed"],
-                "site": fold["site"],
-                "condition": condition,
-                "macro_f1": float(f1),
-                "train_size": len(train),
-                "eval_size": len(eval_df)
-            })
-
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(
-        output_dir / "controlled_site_results.csv",
-        index=False
+    reference_pipeline = create_LR_pipeline(
+        with_SVD=False, OAA=False, filter_voc=False
     )
 
-    paired = results_df.pivot(
-        index=["seed", "site"],
+    classifier_template = clone(reference_pipeline.named_steps["clf"])
+    classifier_template.set_params(C=1.0)
+
+    for fold in create_controlled_site_sets(cfg, research_df):
+        seed = int(fold["seed"])
+        site = fold["site"]
+        eval_df = fold["eval"]
+
+        print(f"\nSeed={seed}, Held-out site={site}")
+
+        for condition in ["seen", "unseen"]:
+            fold_train = fold[f"train_{condition}"]
+
+            vectorizer = clone(reference_pipeline.named_steps["tfidf"])
+            X_train = vectorizer.fit_transform(fold_train[text_c])
+            X_eval = vectorizer.transform(eval_df[text_c])
+
+            y_train = fold_train[target_c].to_numpy()
+            y_eval = eval_df[target_c].to_numpy()
+
+            configurations = {
+                "E0": (X_train, X_eval)
+            }
+
+            if apply_site_weighting:
+                X_train_e4, X_eval_e4, selected_idx, site_scores = (
+                    apply_site_mi_weighting(
+                        X_train, X_eval, fold_train[site_c].to_numpy(),
+                        fraction=fraction, weight=feature_weight
+                    )
+                )
+
+                configurations["E4"] = (X_train_e4, X_eval_e4)
+
+                feature_names = vectorizer.get_feature_names_out()
+
+                for rank, idx in enumerate(selected_idx, start=1):
+                    selected_feature_rows.append({
+                        "seed": seed,
+                        "site": site,
+                        "condition": condition,
+                        "rank": rank,
+                        "feature": feature_names[idx],
+                        "site_mi": float(site_scores[idx])
+                    })
+
+            for method, (X_tr, X_ev) in configurations.items():
+                classifier = clone(classifier_template)
+                classifier.fit(X_tr, y_train)
+                predicted = classifier.predict(X_ev)
+
+                macro_f1 = f1_score(
+                    y_eval, predicted, labels=fold["classes"],
+                    average="macro", zero_division=0
+                )
+                accuracy = accuracy_score(y_eval, predicted)
+
+                results.append({
+                    "seed": seed,
+                    "site": site,
+                    "condition": condition,
+                    "method": method,
+                    "threshold": fraction if method == "E4" else 0.0,
+                    "weight": feature_weight if method == "E4" else 1.0,
+                    "macro_f1": float(macro_f1),
+                    "accuracy": float(accuracy),
+                    "train_size": len(fold_train),
+                    "eval_size": len(eval_df),
+                    "n_features": X_train.shape[1],
+                    "n_selected": len(selected_idx) if method == "E4" else 0,
+                    "C": 1.0
+                })
+
+                prediction_frames.append(pd.DataFrame({
+                    "seed": seed,
+                    "site": site,
+                    "condition": condition,
+                    "method": method,
+                    "module": eval_df["module"].to_numpy(),
+                    "newid": eval_df["newid"].to_numpy(),
+                    "true_label": y_eval,
+                    "predicted_label": predicted
+                }))
+
+                print(
+                    f"  {condition:6s} | {method} | "
+                    f"Macro-F1={macro_f1:.4f} | Accuracy={accuracy:.4f}"
+                )
+
+        # Save after each complete seed/site evaluation
+        pd.DataFrame(results).to_csv(
+            output_dir / "controlled_site_results.csv", index=False
+        )
+
+    results_df = pd.DataFrame(results)
+
+    if prediction_frames:
+        pd.concat(prediction_frames, ignore_index=True).to_csv(
+            output_dir / "controlled_site_predictions.csv", index=False
+        )
+
+    if selected_feature_rows:
+        pd.DataFrame(selected_feature_rows).to_csv(
+            output_dir / "controlled_site_selected_features.csv", index=False
+        )
+
+    if not apply_site_weighting:
+        return results_df
+
+    # Paired differences: E4 minus E0
+    pairs = results_df.pivot(
+        index=["seed", "site", "condition"],
+        columns="method",
+        values=["macro_f1", "accuracy"]
+    )
+
+    pairs.columns = [f"{metric}_{method}" for metric, method in pairs.columns]
+    pairs = pairs.reset_index()
+
+    pairs["delta_f1"] = pairs["macro_f1_E4"] - pairs["macro_f1_E0"]
+    pairs["delta_accuracy"] = pairs["accuracy_E4"] - pairs["accuracy_E0"]
+
+    pairs.to_csv(output_dir / "controlled_site_deltas.csv", index=False)
+
+    # Seen-unseen gap for each method on the same seed/site
+    gaps = results_df.pivot(
+        index=["seed", "site", "method"],
         columns="condition",
         values="macro_f1"
     ).reset_index()
 
-    paired["gap"] = paired["seen"] - paired["unseen"]
+    gaps["seen_unseen_gap"] = gaps["seen"] - gaps["unseen"]
 
-    summary = (
-        paired.groupby("site")
-        .agg(
-            seen_mean=("seen", "mean"),
-            seen_median=("seen", "median"),
-            unseen_mean=("unseen", "mean"),
-            unseen_median=("unseen", "median"),
-            gap_mean=("gap", "mean"),
-            gap_median=("gap", "median"),
-            gap_std=("gap", "std"),
-            gap_q25=("gap", lambda x: x.quantile(0.25)),
-            gap_q75=("gap", lambda x: x.quantile(0.75)),
-            n_seeds=("seed", "nunique")
-        )
-        .reset_index()
+    gap_comparison = gaps.pivot(
+        index=["seed", "site"],
+        columns="method",
+        values="seen_unseen_gap"
+    ).reset_index()
+
+    gap_comparison["delta_gap"] = (
+        gap_comparison["E4"] - gap_comparison["E0"]
     )
 
-    summary["gap_iqr"] = summary["gap_q75"] - summary["gap_q25"]
-
-    summary.to_csv(
-        output_dir / "controlled_site_summary.csv",
-        index=False
+    gap_comparison.to_csv(
+        output_dir / "controlled_site_gap_comparison.csv", index=False
     )
+
+    # Aggregate performance per site and condition
+    site_summary = pairs.groupby(
+        ["site", "condition"], as_index=False
+    ).agg(
+        e0_mean_f1=("macro_f1_E0", "mean"),
+        e4_mean_f1=("macro_f1_E4", "mean"),
+        mean_delta_f1=("delta_f1", "mean"),
+        std_delta_f1=("delta_f1", "std"),
+        e0_mean_accuracy=("accuracy_E0", "mean"),
+        e4_mean_accuracy=("accuracy_E4", "mean"),
+        mean_delta_accuracy=("delta_accuracy", "mean"),
+        n_seeds=("seed", "nunique")
+    )
+
+    site_summary.to_csv(
+        output_dir / "controlled_site_summary.csv", index=False
+    )
+
+    # Overall results
+    overall_summary = pairs.groupby(
+        "condition", as_index=False
+    ).agg(
+        e0_mean_f1=("macro_f1_E0", "mean"),
+        e4_mean_f1=("macro_f1_E4", "mean"),
+        mean_delta_f1=("delta_f1", "mean"),
+        std_delta_f1=("delta_f1", "std"),
+        e0_mean_accuracy=("accuracy_E0", "mean"),
+        e4_mean_accuracy=("accuracy_E4", "mean"),
+        mean_delta_accuracy=("delta_accuracy", "mean")
+    )
+
+    mean_e0_gap = gap_comparison["E0"].mean()
+    mean_e4_gap = gap_comparison["E4"].mean()
+    mean_delta_gap = gap_comparison["delta_gap"].mean()
+
+    overall_summary["mean_gap_E0"] = mean_e0_gap
+    overall_summary["mean_gap_E4"] = mean_e4_gap
+    overall_summary["delta_gap"] = mean_delta_gap
+
+    overall_summary.to_csv(
+        output_dir / "controlled_overall_summary.csv", index=False
+    )
+
+    print("\n" + "=" * 70)
+    print("CONTROLLED LOSO — E0 VS E4")
+    print("=" * 70)
+    print(overall_summary.round(5).to_string(index=False))
+
+    print(f"\nMean Seen-Unseen gap E0: {mean_e0_gap:.4f}")
+    print(f"Mean Seen-Unseen gap E4: {mean_e4_gap:.4f}")
+    print(f"Change in gap: {mean_delta_gap:+.4f}")
+
+    return results_df, site_summary, overall_summary
 
 
 def run_predict_site_exp(cfg):
@@ -432,6 +576,38 @@ def run_module_only_site_pred(cfg):
         accuracy = accuracy_score(eval_df["site"], pred)
         print(f"Seed {fold['seed']}: {accuracy:.4f}")
 
+
+def apply_site_mi_weighting(X_train, X_eval, train_sites, fraction=0.02, weight=0.50):
+    """Downweight the top fraction of Site-MI features using training data only."""
+
+    if not 0 <= fraction <= 1:
+        raise ValueError("fraction must be between 0 and 1.")
+    if not 0 <= weight <= 1:
+        raise ValueError("weight must be between 0 and 1.")
+    if len(train_sites) != X_train.shape[0]:
+        raise ValueError("train_sites must match the number of training rows.")
+
+    X_binary = X_train.copy().tocsr()
+    X_binary.data[:] = 1.0
+
+    site_scores = mutual_info_classif(
+        X_binary, np.asarray(train_sites),
+        discrete_features=True, random_state=42
+    )
+
+    n_features = X_train.shape[1]
+    n_selected = int(np.ceil(n_features * fraction))
+
+    ranking = np.lexsort((np.arange(n_features), -site_scores))
+    selected_idx = ranking[:n_selected]
+
+    feature_weights = np.ones(n_features, dtype=np.float64)
+    feature_weights[selected_idx] = weight
+
+    X_train_weighted = X_train.multiply(feature_weights).tocsr()
+    X_eval_weighted = X_eval.multiply(feature_weights).tocsr()
+
+    return X_train_weighted, X_eval_weighted, selected_idx, site_scores
 
 
 def E2_autocut_top_site_features(cfg):
@@ -1940,6 +2116,8 @@ def main(cfg: DictConfig):
         E_seen_feature_comparison(cfg)
     elif exp == "E4_feature_downweighting":
         E4_feature_downweighting(cfg)
+    elif exp == "loso_LR_controlled_E4":
+        run_controlled_loso_experiment(cfg, apply_site_weighting=True)
     else:
         print("Please check experiment name in config")
 

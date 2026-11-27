@@ -1,0 +1,17 @@
+# Core data processing and numerical computing
+numpy
+pandas
+scipy
+
+# Machine learning: TF-IDF, SVD, SVM, Logistic Regression, MI, evaluation
+scikit-learn
+
+# Configuration management (Hydra includes OmegaConf)
+hydra-core
+
+# Model serialization used by train_baseline.py
+joblib
+
+# Plotting / exploratory analysis
+matplotlib
+seaborn

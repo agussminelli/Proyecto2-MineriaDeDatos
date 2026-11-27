@@ -171,10 +171,49 @@ def check_duplicated_newIDs(research_df):
         (research_df.groupby(["site", "newid"])["module"]
             .nunique() > 1).sum())
 
+def print_error_examples():
+
+    examples = [
+        ("AP", 844, "Respiratory — corrected by E4"),
+        ("AP", 2214, "Congenital — new error in E4"),
+    ]
+
+    data, _, headers, _, _ = simple_load_dataset()
+
+    df = data.copy()
+    if not hasattr(df, "columns"):
+        import pandas as pd
+        df = pd.DataFrame(df, columns=headers)
+
+    for site, newid, description in examples:
+        match = df[
+            (df["site"].astype(str) == site)
+            & (df["newid"].astype(str) == str(newid))
+        ]
+
+        print(f"\n{'=' * 70}")
+        print(description)
+        print(f"Site: {site}, newid: {newid}")
+
+        if match.empty:
+            print("No matching record found.")
+            continue
+
+        for _, row in match.iterrows():
+            print(f"Module: {row['module']}")
+            print(f"True cause: {row['gs_text34']}")
+            print(f"\nNarrative:\n{row['open_response']}")
+
 
 if __name__ == "__main__":
+    
+    # #--new_id Check for duplicates--#
+    # train_df, dev_df,_= load_and_preprocess(return_df=True)
+    # research_df = pd.concat([train_df, dev_df], ignore_index=True)
+    # check_duplicated_newIDs(research_df)
 
-    train_df, dev_df,_= load_and_preprocess(return_df=True)
-    research_df = pd.concat([train_df, dev_df], ignore_index=True)
-    check_duplicated_newIDs(research_df)
+    # #--Subgroup Exploration--#
     # explore_subgroups()
+
+    # #--Error Examples--#
+    print_error_examples()
